@@ -1,0 +1,12 @@
+# Do not edit - changes here will be overwritten by Copier
+_commit: v1
+_src_path: gh:pydev-guide/pyrepo-copier
+author_email: jdickerson@berkeley.edu
+author_name: Josh Dickerson
+github_username: Lucaslab-Berkeley
+mode: tooling
+module_name: picasso
+project_name: PICASSO
+project_short_description: Projection Improvement by Ctf Aberration, magnification
+    aniSotropy, and Scattering factor Optimization
+
