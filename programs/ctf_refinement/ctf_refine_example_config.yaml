@@ -1,0 +1,80 @@
+# Example configuration file for CTF refinement in PICASSO
+# This file demonstrates how to configure all parameters for CTF refinement
+
+# Input configuration
+input_config:
+  # Path to the template volume file (required)
+  template_path: "/path/to/template.mrc"
+  
+  # Template box size as [height, width] in pixels (required)
+  template_box_size: [256, 256]
+  
+  # Directory containing micrograph files (required)
+  micrograph_directory: "/path/to/micrographs"
+  
+  # Pattern to match micrograph files (optional, default: "*.mrc")
+  micrograph_pattern: "*.mrc"
+  
+  # Directory containing results CSV files (required)
+  results_directory: "/path/to/results"
+  
+  # Pattern to match results files (optional, default: "*_results.csv")
+  results_pattern: "*_results.csv"
+  
+  # Batch size for processing (optional, default: 32)
+  batch_size: 32
+
+# Output configuration
+output_config:
+  # Whether to allow overwriting existing output files (optional, default: true)
+  allow_file_overwrite: true
+  
+  # Directory where refined CTF parameters will be saved (optional)
+  # If None, results will not be automatically saved
+  output_directory: "/path/to/output"
+
+# Computational configuration
+computational_config:
+  # GPU/CPU device to use for computation (optional, default: 0)
+  # Can be:
+  #   - An integer (e.g., 0) for GPU ID
+  #   - A string like "cuda:0" for GPU ID
+  #   - "cpu" for CPU computation
+  gpu_id: 0
+
+# CTF refinement configuration
+ctf_refine_config:
+  # Whether to refine anisotropic magnification (optional, default: false)
+  refine_anisotropic_mag: false
+  
+  # Whether to refine astigmatism per micrograph (optional, default: false)
+  refine_astigmatism: false
+  
+  # Whether to refine beam tilt (optional, default: false)
+  refine_beam_tilt: false
+  
+  # Whether to apply global filtering to micrographs (optional, default: true)
+  apply_global_filtering: true
+  
+  # Number of iterations per micrograph (optional, default: 10)
+  per_micrograph_iterations: 10
+  
+  # Number of iterations per dataset (optional, default: 10)
+  per_dataset_iterations: 10
+
+# Preprocessing filters configuration
+# This is a PreprocessingFilters object from leopard_em
+# The exact fields depend on the leopard_em package version
+# Below is a typical example structure
+preprocessing_filters:
+  whitening_filter:
+    enabled: true
+    do_power_spectrum: true
+    max_freq: 1.0  # In terms of Nyquist frequency
+    num_freq_bins: null
+  bandpass_filter:
+    enabled: false
+    falloff: null
+    high_freq_cutoff: null  # Both in terms of Nyquist frequency (e.g. low-pass to 3 Å @ 1.06 Å/px would be high_freq_cutoff=0.353)
+    low_freq_cutoff: null
+

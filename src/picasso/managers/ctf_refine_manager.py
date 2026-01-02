@@ -55,8 +55,8 @@ class CTFRefineManager(BaseModelPICASSO):
         """Create the kwargs for the backend refine_template core function."""
         # Ensure the template is loaded in as a Tensor object
         template = load_template_tensor(
-            template_volume=self.template_volume,
-            template_volume_path=self.template_volume_path,
+            template_volume=None,
+            template_volume_path=self.input_config.template_path,
         )
 
         results_files = get_results_files(
