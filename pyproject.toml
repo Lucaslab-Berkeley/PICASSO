@@ -35,7 +35,18 @@ classifiers = [
     "Typing :: Typed",
 ]
 # add your package dependencies here
-dependencies = []
+dependencies = [
+    "torch",
+    "einops",
+    "numpy",
+    "pandas",
+    "mrcfile",
+    "pydantic",
+    "pyyaml",
+    "types-PyYAML",
+    "leopard-em",
+    "torch-ctf",
+]
 
 # https://peps.python.org/pep-0621/#dependencies-optional-dependencies
 # add dependencies for "extra" features here.  Not dev dependencies.
@@ -71,6 +82,8 @@ dev = [
 
 [tool.uv.sources]
 PICASSO = { workspace = true }
+torch-ctf = { path = "../../teamtomo/torch-ctf", editable = true }
+leopard-em = { path = "../Leopard-EM", editable = true }
 
 # https://docs.astral.sh/ruff
 [tool.ruff]
@@ -125,6 +138,7 @@ disallow_any_generics = false
 disallow_subclassing_any = false
 show_error_codes = true
 pretty = true
+# Automatically install missing type stubs (handled by uv sync via dependencies)
 # plugins = ["pydantic.mypy"]
 
 # # module specific overrides
