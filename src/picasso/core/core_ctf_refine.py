@@ -1,12 +1,64 @@
 """Core functions for CTF refinement."""
 
+import math
 from typing import Any
 
+import numpy as np
 import torch
 from leopard_em.backend.core_differentiable_refine import core_differentiable_refine
 from leopard_em.pydantic_models.config import PreprocessingFilters
 from leopard_em.pydantic_models.data_structures import ParticleStack
 from leopard_em.utils.backend_setup import setup_particle_backend_kwargs
+
+
+def output_mag_matrix(mag_matrix: torch.Tensor) -> None:
+    """Output magnification matrix with axis of stretching and anisotropy.
+
+    Parameters
+    ----------
+    mag_matrix : torch.Tensor
+        2x2 anisotropic magnification matrix.
+    """
+    # Convert to numpy for eigenvalue calculation
+    mag_np = mag_matrix.detach().cpu().numpy()
+
+    print("\nMagnification Matrix:")
+    print(mag_np)
+
+    # Calculate eigenvalues and eigenvectors using numpy
+    eigenvalues, eigenvectors = np.linalg.eig(mag_np)
+
+    # Get real parts (in case of numerical issues)
+    eigenvalues = np.real(eigenvalues)
+    eigenvectors = np.real(eigenvectors)
+
+    # Find the index of the largest eigenvalue
+    max_idx = np.argmax(np.abs(eigenvalues))
+    lambda_max = eigenvalues[max_idx]
+    lambda_min = eigenvalues[1 - max_idx]  # The other eigenvalue
+
+    # Get the eigenvector corresponding to the largest eigenvalue
+    eigenvector = eigenvectors[:, max_idx]
+
+    # Normalize eigenvector
+    norm = np.linalg.norm(eigenvector)
+    if norm > 1e-10:
+        eigenvector = eigenvector / norm
+
+    # Calculate angle in degrees (axis of stretching)
+    angle_deg = math.degrees(math.atan2(eigenvector[1], eigenvector[0]))
+
+    # Calculate anisotropy percentage
+    # Anisotropy = (max - min) / mean * 100
+    mean_mag = (lambda_max + lambda_min) / 2.0
+    if abs(mean_mag) > 1e-10:
+        anisotropy_pct = abs(lambda_max - lambda_min) / abs(mean_mag) * 100.0
+    else:
+        anisotropy_pct = 0.0
+
+    print(f"Axis of stretching: {angle_deg:.2f} degrees")
+    print(f"Magnification anisotropy: {anisotropy_pct:.2f}%")
+    print()
 
 
 def core_refine_ctf(
@@ -74,10 +126,12 @@ def core_refine_ctf(
         - "astigmatism_angle": torch.Tensor
         - "astigmatism_magnitude": torch.Tensor
     """
+    torch.set_grad_enabled(True)
     # Initialize parameters with gradients for optimization
     # beam tilt x and y (Zernike polynomials)
     # astigmatism optimized per micrograph so later
     # anisotropic mag
+    device = torch.device(device)
     optimizer_aniso = None
     optimizer_beam_tilt = None
     if refine_anisotropic_mag:
@@ -179,27 +233,52 @@ def core_refine_ctf(
                 if initial_astigmatism_angle is not None:
                     initial_angle = initial_astigmatism_angle[i].to(device)
                 else:
-                    initial_angle = torch.tensor(
-                        particle_backend_kwargs["defocus_angle"], device=device
-                    )
+                    defocus_angle_val = particle_backend_kwargs["defocus_angle"]
+                    # Extract first element if tensor (same for all particles)
+                    if (
+                        isinstance(defocus_angle_val, torch.Tensor)
+                        and defocus_angle_val.numel() > 1
+                    ):
+                        defocus_angle_val = defocus_angle_val[0].item()
+                    initial_angle = torch.tensor(defocus_angle_val, device=device)
 
                 if initial_astigmatism_magnitude is not None:
                     initial_magnitude = initial_astigmatism_magnitude[i].to(device)
                     # Need to compute defocus_mean from initial values
-                    initial_defocus_u = torch.tensor(
-                        particle_backend_kwargs["defocus_u"], device=device
-                    )
-                    initial_defocus_v = torch.tensor(
-                        particle_backend_kwargs["defocus_v"], device=device
-                    )
+                    defocus_u_val = particle_backend_kwargs["defocus_u"]
+                    defocus_v_val = particle_backend_kwargs["defocus_v"]
+                    # Extract first element if tensor
+                    # (difference is same for all particles)
+                    if (
+                        isinstance(defocus_u_val, torch.Tensor)
+                        and defocus_u_val.numel() > 1
+                    ):
+                        defocus_u_val = defocus_u_val[0].item()
+                    if (
+                        isinstance(defocus_v_val, torch.Tensor)
+                        and defocus_v_val.numel() > 1
+                    ):
+                        defocus_v_val = defocus_v_val[0].item()
+                    initial_defocus_u = torch.tensor(defocus_u_val, device=device)
+                    initial_defocus_v = torch.tensor(defocus_v_val, device=device)
                     initial_defocus_mean = (initial_defocus_u + initial_defocus_v) / 2.0
                 else:
-                    initial_defocus_u = torch.tensor(
-                        particle_backend_kwargs["defocus_u"], device=device
-                    )
-                    initial_defocus_v = torch.tensor(
-                        particle_backend_kwargs["defocus_v"], device=device
-                    )
+                    defocus_u_val = particle_backend_kwargs["defocus_u"]
+                    defocus_v_val = particle_backend_kwargs["defocus_v"]
+                    # Extract first element if tensor
+                    # (difference is same for all particles)
+                    if (
+                        isinstance(defocus_u_val, torch.Tensor)
+                        and defocus_u_val.numel() > 1
+                    ):
+                        defocus_u_val = defocus_u_val[0].item()
+                    if (
+                        isinstance(defocus_v_val, torch.Tensor)
+                        and defocus_v_val.numel() > 1
+                    ):
+                        defocus_v_val = defocus_v_val[0].item()
+                    initial_defocus_u = torch.tensor(defocus_u_val, device=device)
+                    initial_defocus_v = torch.tensor(defocus_v_val, device=device)
                     initial_magnitude = initial_defocus_u - initial_defocus_v
                     initial_defocus_mean = (initial_defocus_u + initial_defocus_v) / 2.0
 
@@ -214,15 +293,30 @@ def core_refine_ctf(
                     [astigmatism_angle, astigmatism_magnitude], lr=0.5
                 )
             else:
-                astigmatism_angle = torch.tensor(
-                    particle_backend_kwargs["defocus_angle"], device=device
-                )
-                defocus_u = torch.tensor(
-                    particle_backend_kwargs["defocus_u"], device=device
-                )
-                defocus_v = torch.tensor(
-                    particle_backend_kwargs["defocus_v"], device=device
-                )
+                defocus_angle_val = particle_backend_kwargs["defocus_angle"]
+                # Extract first element if tensor (same for all particles)
+                if (
+                    isinstance(defocus_angle_val, torch.Tensor)
+                    and defocus_angle_val.numel() > 1
+                ):
+                    defocus_angle_val = defocus_angle_val[0].item()
+                astigmatism_angle = torch.tensor(defocus_angle_val, device=device)
+                defocus_u_val = particle_backend_kwargs["defocus_u"]
+                defocus_v_val = particle_backend_kwargs["defocus_v"]
+                # Extract first element if tensor
+                # (difference is same for all particles)
+                if (
+                    isinstance(defocus_u_val, torch.Tensor)
+                    and defocus_u_val.numel() > 1
+                ):
+                    defocus_u_val = defocus_u_val[0].item()
+                if (
+                    isinstance(defocus_v_val, torch.Tensor)
+                    and defocus_v_val.numel() > 1
+                ):
+                    defocus_v_val = defocus_v_val[0].item()
+                defocus_u = torch.tensor(defocus_u_val, device=device)
+                defocus_v = torch.tensor(defocus_v_val, device=device)
                 astigmatism_magnitude = defocus_u - defocus_v
 
             # change params for optimizable parameters
@@ -251,7 +345,7 @@ def core_refine_ctf(
                     num_cuda_streams=1,
                     **particle_backend_kwargs,
                 )
-                refined_scaled_mip = result["refined_scaled_mip"]
+                refined_scaled_mip = result["refined_z_score"]
                 micrograph_loss = -refined_scaled_mip
 
                 # Optimize astigmatism parameters (per micrograph, inner loop)
@@ -262,7 +356,9 @@ def core_refine_ctf(
                     and optimizer_astig is not None
                 ):
                     optimizer_astig.zero_grad()
-                    micrograph_loss.backward()
+                    # Retain graph if we need gradients for dataset-level optimizers
+                    retain_graph = refine_anisotropic_mag or refine_beam_tilt
+                    micrograph_loss.backward(retain_graph=retain_graph)
                     optimizer_astig.step()
 
             # Store final astigmatism values
@@ -276,10 +372,19 @@ def core_refine_ctf(
             # Accumulate loss for dataset-level optimizers
             # Need to keep gradients for dataset-level parameters
             if refine_anisotropic_mag or refine_beam_tilt:
+                # Ensure micrograph_loss is a scalar
+                if micrograph_loss.numel() > 1:
+                    micrograph_loss = micrograph_loss.mean()
                 if dataset_loss is None:
                     dataset_loss = micrograph_loss
                 else:
                     dataset_loss = dataset_loss + micrograph_loss
+                # Print micrograph loss
+                if hasattr(micrograph_loss, "item"):
+                    loss_val = micrograph_loss.item()
+                else:
+                    loss_val = float(micrograph_loss)
+                print(f"  Micrograph {i + 1}/{len(results_files)} loss: {loss_val:.6f}")
 
         # Optimize dataset-level parameters (outer loop)
         if (
@@ -299,6 +404,21 @@ def core_refine_ctf(
             optimizer_beam_tilt.zero_grad()
             dataset_loss.backward()
             optimizer_beam_tilt.step()
+
+        # Print dataset-level loss after each outer iteration
+        if dataset_loss is not None:
+            if hasattr(dataset_loss, "item"):
+                loss_val = dataset_loss.item()
+            else:
+                loss_val = float(dataset_loss)
+            print(
+                f"Dataset iteration {outer_iteration + 1}/"
+                f"{per_dataset_iterations} loss: {loss_val:.6f}"
+            )
+
+        # Output magnification matrix information
+        if refine_anisotropic_mag:
+            output_mag_matrix(anistropic_mag)
 
     return {
         "anistropic_mag": anistropic_mag.detach(),

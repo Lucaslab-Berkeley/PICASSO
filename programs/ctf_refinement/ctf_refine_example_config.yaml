@@ -9,12 +9,6 @@ input_config:
   # Template box size as [height, width] in pixels (required)
   template_box_size: [256, 256]
   
-  # Directory containing micrograph files (required)
-  micrograph_directory: "/path/to/micrographs"
-  
-  # Pattern to match micrograph files (optional, default: "*.mrc")
-  micrograph_pattern: "*.mrc"
-  
   # Directory containing results CSV files (required)
   results_directory: "/path/to/results"
   

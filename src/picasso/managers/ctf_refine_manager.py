@@ -129,6 +129,53 @@ class CTFRefineManager(BaseModelPICASSO):
         with open(output_path, "wb") as f:
             pickle.dump(refined_ctf_params, f)
 
+        # Also write a human-readable text file
+        txt_output_path = output_path.with_suffix(".txt")
+        with open(txt_output_path, "w") as f:
+            f.write("Refined CTF Parameters\n")
+            f.write("=" * 50 + "\n\n")
+
+            if "anistropic_mag" in refined_ctf_params:
+                f.write("Anisotropic Magnification Matrix:\n")
+                mag_matrix = refined_ctf_params["anistropic_mag"]
+                if isinstance(mag_matrix, torch.Tensor):
+                    mag_matrix_np = mag_matrix.cpu().numpy()
+                    f.write(f"{mag_matrix_np}\n\n")
+                else:
+                    f.write(f"{mag_matrix}\n\n")
+
+            if "odd_zernikes" in refined_ctf_params:
+                f.write("Odd Zernike Coefficients:\n")
+                zernikes = refined_ctf_params["odd_zernikes"]
+                for key, value in zernikes.items():
+                    if isinstance(value, torch.Tensor):
+                        val = value.cpu().item()
+                    else:
+                        val = value
+                    f.write(f"  {key}: {val:.6f}\n")
+                f.write("\n")
+
+            if "astigmatism_angle" in refined_ctf_params:
+                f.write("Astigmatism Angles (per micrograph):\n")
+                angles = refined_ctf_params["astigmatism_angle"]
+                if isinstance(angles, torch.Tensor):
+                    angles_np = angles.cpu().numpy()
+                    for i, angle in enumerate(angles_np):
+                        f.write(f"  Micrograph {i + 1}: {angle:.6f}\n")
+                else:
+                    f.write(f"{angles}\n")
+                f.write("\n")
+
+            if "astigmatism_magnitude" in refined_ctf_params:
+                f.write("Astigmatism Magnitudes (per micrograph):\n")
+                magnitudes = refined_ctf_params["astigmatism_magnitude"]
+                if isinstance(magnitudes, torch.Tensor):
+                    magnitudes_np = magnitudes.cpu().numpy()
+                    for i, mag in enumerate(magnitudes_np):
+                        f.write(f"  Micrograph {i + 1}: {mag:.6f}\n")
+                else:
+                    f.write(f"{magnitudes}\n")
+
     def refine_ctf(
         self,
         initial_mag_matrix: torch.Tensor | None = None,

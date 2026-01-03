@@ -14,8 +14,6 @@ class InputConfig(BaseModelPICASSO):
 
     template_path: str
     template_box_size: tuple[int, int]
-    micrograph_directory: str
-    micrograph_pattern: str = "*.mrc"
     results_directory: str
     results_pattern: str = "*_results.csv"
     batch_size: int = 32
@@ -25,12 +23,6 @@ class InputConfig(BaseModelPICASSO):
         """Validate input paths for existence."""
         if self.template_path is not None and not os.path.exists(self.template_path):
             raise ValueError(f"Template path '{self.template_path}' does not exist.")
-        if self.micrograph_directory is not None and not os.path.exists(
-            self.micrograph_directory
-        ):
-            raise ValueError(
-                f"Micrograph directory '{self.micrograph_directory}' does not exist."
-            )
         if self.results_directory is not None and not os.path.exists(
             self.results_directory
         ):
@@ -39,18 +31,6 @@ class InputConfig(BaseModelPICASSO):
             )
 
         # Validate that files matching the pattern exist
-        if (
-            self.micrograph_directory is not None
-            and self.micrograph_pattern is not None
-        ):
-            pattern_path = Path(self.micrograph_directory) / self.micrograph_pattern
-            matching_files = list(pattern_path.parent.glob(pattern_path.name))
-            if not matching_files:
-                raise ValueError(
-                    f"No files matching pattern '{self.micrograph_pattern}' found in "
-                    f"micrograph directory '{self.micrograph_directory}'."
-                )
-
         if self.results_directory is not None and self.results_pattern is not None:
             pattern_path = Path(self.results_directory) / self.results_pattern
             matching_files = list(pattern_path.parent.glob(pattern_path.name))
