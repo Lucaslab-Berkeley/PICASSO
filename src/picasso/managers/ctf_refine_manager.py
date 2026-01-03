@@ -79,6 +79,7 @@ class CTFRefineManager(BaseModelPICASSO):
                 self.ctf_refine_config.per_micrograph_iterations
             ),
             "per_dataset_iterations": (self.ctf_refine_config.per_dataset_iterations),
+            "convergence_threshold": self.ctf_refine_config.convergence_threshold,
         }
 
         return backend_kwargs
