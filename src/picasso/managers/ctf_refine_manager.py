@@ -121,6 +121,7 @@ class CTFRefineManager(BaseModelPICASSO):
             allow_file_overwrite=self.output_config.allow_file_overwrite,
         )
 
+    # pylint: disable=too-many-arguments,too-many-positional-arguments
     def refine_ctf(
         self,
         initial_mag_matrix: torch.Tensor | None = None,

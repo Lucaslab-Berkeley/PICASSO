@@ -79,7 +79,7 @@ dev = [
     "pre-commit-uv",
     "rich",  # https://github.com/Textualize/rich
     "ruff",
-    
+    "pylint",
 ]
 
 [tool.uv.sources]

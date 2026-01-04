@@ -61,6 +61,7 @@ def output_mag_matrix(mag_matrix: torch.Tensor) -> None:
     print()
 
 
+# pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
 def core_refine_ctf(
     template: torch.Tensor,
     template_box_size: tuple[int, int],
@@ -166,6 +167,7 @@ def core_refine_ctf(
     )
 
 
+# pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-branches
 def _setup_refinement(
     results_files: list[str],
     device: torch.device,
@@ -282,6 +284,7 @@ def _setup_refinement(
     }
 
 
+# pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-branches,too-many-statements
 def _micrograph_loop(
     i: int,
     results_path: str,
@@ -612,6 +615,7 @@ def _micrograph_loop(
     return micrograph_loss, astigmatism_result
 
 
+# pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-branches,too-many-statements
 def _dataset_loop(
     results_files: list[str],
     template: torch.Tensor,

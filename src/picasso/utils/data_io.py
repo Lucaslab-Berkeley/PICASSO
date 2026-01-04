@@ -1,6 +1,8 @@
 """Utility functions dealing with basic data I/O operations."""
 
+import csv
 import os
+import pickle
 from pathlib import Path
 from typing import Any
 
@@ -198,8 +200,6 @@ def read_refined_ctf_params(
     FileNotFoundError
         If the pickle file does not exist.
     """
-    import pickle
-
     pkl_path = Path(pkl_path)
     if not pkl_path.exists():
         raise FileNotFoundError(f"Pickle file not found: {pkl_path}")
@@ -210,6 +210,7 @@ def read_refined_ctf_params(
     return refined_ctf_params
 
 
+# pylint: disable=too-many-locals,too-many-branches
 def write_refined_ctf_params(
     refined_ctf_params: dict[str, Any],
     output_path: str | os.PathLike | Path,
@@ -232,8 +233,6 @@ def write_refined_ctf_params(
         If file exists and overwrite is not allowed, or if directory
         does not permit writing.
     """
-    import pickle
-
     output_path = Path(output_path)
 
     # Check if file exists and overwrite is not allowed
@@ -321,8 +320,6 @@ def write_loss_csvs(
     ValueError
         If directory does not permit writing.
     """
-    import csv
-
     output_dir = Path(output_directory)
     # Create directory if it doesn't exist
     output_dir.mkdir(parents=True, exist_ok=True)

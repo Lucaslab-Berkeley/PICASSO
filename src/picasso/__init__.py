@@ -1,4 +1,4 @@
-"""Projection Improvement by Ctf Aberration, magnification aniSotropy, and Scattering factor Optimization"""
+"""PICASSO."""
 
 from importlib.metadata import PackageNotFoundError, version
 
