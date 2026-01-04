@@ -70,11 +70,14 @@ class CTFRefineManager(BaseModelPICASSO):
             results_pattern=self.input_config.results_pattern,
         )
 
+        # Get list of devices from config
+        gpu_devices = self.computational_config.gpu_devices
+
         backend_kwargs = {
             "template": template,
             "template_box_size": self.input_config.template_box_size,
             "results_files": results_files,
-            "device": self.computational_config.gpu_id,
+            "device_list": gpu_devices,
             "refine_anisotropic_mag": self.ctf_refine_config.refine_anisotropic_mag,
             "refine_astigmatism": self.ctf_refine_config.refine_astigmatism,
             "refine_beam_tilt": self.ctf_refine_config.refine_beam_tilt,

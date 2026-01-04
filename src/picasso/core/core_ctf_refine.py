@@ -1,6 +1,9 @@
-"""Core functions for CTF refinement."""
+"""Core functions for CTF refinement with multi-GPU support."""
+# pylint: disable=too-many-lines
 
 import math
+from queue import Queue
+from threading import Thread
 from typing import Any
 
 import numpy as np
@@ -19,37 +22,25 @@ def output_mag_matrix(mag_matrix: torch.Tensor) -> None:
     mag_matrix : torch.Tensor
         2x2 anisotropic magnification matrix.
     """
-    # Convert to numpy for eigenvalue calculation
     mag_np = mag_matrix.detach().cpu().numpy()
-
     print("\nMagnification Matrix:")
     print(mag_np)
 
-    # Calculate eigenvalues and eigenvectors using numpy
     eigenvalues, eigenvectors = np.linalg.eig(mag_np)
-
-    # Get real parts (in case of numerical issues)
     eigenvalues = np.real(eigenvalues)
     eigenvectors = np.real(eigenvectors)
 
-    # Find the index of the largest eigenvalue
     max_idx = np.argmax(np.abs(eigenvalues))
     lambda_max = eigenvalues[max_idx]
-    lambda_min = eigenvalues[1 - max_idx]  # The other eigenvalue
+    lambda_min = eigenvalues[1 - max_idx]
 
-    # Get the eigenvector corresponding to the largest eigenvalue
     eigenvector = eigenvectors[:, max_idx]
-
-    # Normalize eigenvector
     norm = np.linalg.norm(eigenvector)
     if norm > 1e-10:
         eigenvector = eigenvector / norm
 
-    # Calculate angle in degrees (axis of stretching)
     angle_deg = math.degrees(math.atan2(eigenvector[1], eigenvector[0]))
 
-    # Calculate anisotropy percentage
-    # Anisotropy = (max - min) / mean * 100
     mean_mag = (lambda_max + lambda_min) / 2.0
     if abs(mean_mag) > 1e-10:
         anisotropy_pct = abs(lambda_max - lambda_min) / abs(mean_mag) * 100.0
@@ -66,7 +57,7 @@ def core_refine_ctf(
     template: torch.Tensor,
     template_box_size: tuple[int, int],
     results_files: list[str],
-    device: str,
+    device_list: list[torch.device],
     refine_anisotropic_mag: bool,
     refine_astigmatism: bool,
     refine_beam_tilt: bool,
@@ -92,8 +83,9 @@ def core_refine_ctf(
         The box size of the template.
     results_files : list[str]
         The list of results file paths.
-    device : str
-        The device to use for computation.
+    device_list : list[torch.device]
+        List of device objects (e.g., [torch.device("cuda:0"), torch.device("cuda:1")]).
+        Results files are distributed across these GPUs.
     refine_anisotropic_mag : bool
         Whether to refine the anisotropic magnitude.
     refine_astigmatism : bool
@@ -132,12 +124,14 @@ def core_refine_ctf(
         - "astigmatism_magnitude": torch.Tensor
     """
     torch.set_grad_enabled(True)
-    device = torch.device(device)
+
+    # Use first device as primary device for shared parameters
+    primary_device = device_list[0]
 
     # Setup refinement parameters and optimizers
     setup_state = _setup_refinement(
         results_files=results_files,
-        device=device,
+        device=primary_device,
         refine_anisotropic_mag=refine_anisotropic_mag,
         refine_beam_tilt=refine_beam_tilt,
         initial_mag_matrix=initial_mag_matrix,
@@ -146,12 +140,12 @@ def core_refine_ctf(
         initial_astigmatism_magnitude=initial_astigmatism_magnitude,
     )
 
-    # Run the dataset loop
+    # Run the dataset loop with multiple devices
     return _dataset_loop(
         results_files=results_files,
         template=template,
         template_box_size=template_box_size,
-        device=device,
+        device_list=device_list,
         batch_size=batch_size,
         per_micrograph_iterations=per_micrograph_iterations,
         per_dataset_iterations=per_dataset_iterations,
@@ -245,7 +239,6 @@ def _setup_refinement(
                 "Z31s": torch.tensor(0.0, device=device),
             }
 
-    # Validate initial astigmatism parameters if provided
     if initial_astigmatism_angle is not None:
         if initial_astigmatism_angle.shape != (len(results_files),):
             raise ValueError(
@@ -282,6 +275,459 @@ def _setup_refinement(
         "euler_angle_offsets": euler_angle_offsets,
         "defocus_offsets": defocus_offsets,
     }
+
+
+# pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-branches,too-many-statements
+def _dataset_loop(
+    results_files: list[str],
+    template: torch.Tensor,
+    template_box_size: tuple[int, int],
+    device_list: list[torch.device],
+    batch_size: int,
+    per_micrograph_iterations: int,
+    per_dataset_iterations: int,
+    refine_anisotropic_mag: bool,
+    refine_astigmatism: bool,
+    refine_beam_tilt: bool,
+    apply_global_filtering: bool,
+    preprocessing_filters: PreprocessingFilters,
+    convergence_threshold: float,
+    initial_astigmatism_angle: torch.Tensor | None,
+    initial_astigmatism_magnitude: torch.Tensor | None,
+    setup_state: dict[str, Any],
+) -> dict[str, Any]:
+    """Run the outer dataset loop for dataset-level optimization.
+
+    Parameters
+    ----------
+    results_files : list[str]
+        The list of results file paths.
+    template : torch.Tensor
+        The template volume.
+    template_box_size : tuple[int, int]
+        The box size of the template.
+    device_list : list[torch.device]
+        The devices to use for computation.
+    batch_size : int
+        The batch size to use for computation.
+    per_micrograph_iterations : int
+        The number of iterations to run per micrograph.
+    per_dataset_iterations : int
+        The number of iterations to run per dataset.
+    refine_anisotropic_mag : bool
+        Whether to refine the anisotropic magnitude.
+    refine_astigmatism : bool
+        Whether to refine the astigmatism.
+    refine_beam_tilt : bool
+        Whether to refine the beam tilt.
+    apply_global_filtering : bool
+        Whether to apply global filtering to the micrographs.
+    preprocessing_filters : PreprocessingFilters
+        Filters to apply to the particle images.
+    convergence_threshold : float
+        Convergence threshold for early stopping.
+    initial_astigmatism_angle : torch.Tensor | None
+        Initial astigmatism angle tensor.
+    initial_astigmatism_magnitude : torch.Tensor | None
+        Initial astigmatism magnitude tensor.
+    setup_state : dict[str, Any]
+        Setup state from _setup_refinement.
+
+    Returns
+    -------
+    dict[str, Any]
+        Refined CTF parameters and loss tracking data.
+    """
+    primary_device = device_list[0]
+    num_gpus = len(device_list)
+
+    anistropic_mag = setup_state["anistropic_mag"]
+    odd_zernikes = setup_state["odd_zernikes"]
+    astigmatism_angle_all = setup_state["astigmatism_angle_all"]
+    astigmatism_magnitude_all = setup_state["astigmatism_magnitude_all"]
+    optimizer_aniso = setup_state["optimizer_aniso"]
+    optimizer_beam_tilt = setup_state["optimizer_beam_tilt"]
+
+    loss_history: list[float] = []
+    dataset_losses: list[tuple[int, float]] = []
+    micrograph_losses: dict[int, list[tuple[int, float]]] = {}
+    num_micrographs = len(results_files)
+
+    # Distribute micrographs across GPUs
+    gpu_assignments: list[list[int]] = [[] for _ in range(num_gpus)]
+    for idx, mic_idx in enumerate(range(num_micrographs)):
+        gpu_assignments[idx % num_gpus].append(mic_idx)
+
+    print(f"\nUsing {num_gpus} GPUs:")
+    for gpu_id, indices in enumerate(gpu_assignments):
+        print(f"  GPU {gpu_id} ({device_list[gpu_id]}): {len(indices)} micrographs")
+
+    # Create replicas of template on each GPU
+    templates = [template.to(device) for device in device_list]
+
+    # Create setup_state copies for each GPU
+    setup_states = []
+    for device in device_list:
+        if refine_anisotropic_mag:
+            aniso_mag_gpu = anistropic_mag.to(device).detach().requires_grad_(True)
+        else:
+            aniso_mag_gpu = anistropic_mag.to(device)
+        if refine_beam_tilt:
+            z31c_gpu = odd_zernikes["Z31c"].to(device).detach().requires_grad_(True)
+            z31s_gpu = odd_zernikes["Z31s"].to(device).detach().requires_grad_(True)
+        else:
+            z31c_gpu = odd_zernikes["Z31c"].to(device)
+            z31s_gpu = odd_zernikes["Z31s"].to(device)
+        state_copy = {
+            "anistropic_mag": aniso_mag_gpu,
+            "odd_zernikes": {
+                "Z31c": z31c_gpu,
+                "Z31s": z31s_gpu,
+            },
+            "pixel_size_offsets": setup_state["pixel_size_offsets"].to(device),
+            "euler_angle_offsets": setup_state["euler_angle_offsets"].to(device),
+            "defocus_offsets": setup_state["defocus_offsets"].to(device),
+            "optimizer_aniso": None,
+            "optimizer_beam_tilt": None,
+        }
+        setup_states.append(state_copy)
+
+    for outer_iteration in range(per_dataset_iterations):
+        dataset_loss_value: float = 0.0
+
+        if refine_anisotropic_mag and optimizer_aniso is not None:
+            optimizer_aniso.zero_grad()
+        if refine_beam_tilt and optimizer_beam_tilt is not None:
+            optimizer_beam_tilt.zero_grad()
+
+        if num_gpus > 1:
+            # Use threading with a work queue for each GPU
+            result_queue: Queue[dict[str, Any]] = Queue()
+            work_queues: list[Queue[int | None]] = [Queue() for _ in range(num_gpus)]
+
+            # Distribute work to queues
+            for gpu_id, indices in enumerate(gpu_assignments):
+                for idx in indices:
+                    work_queues[gpu_id].put(idx)
+                # Add sentinel to signal end
+                work_queues[gpu_id].put(None)
+
+            # Worker function that processes from its queue
+            # pylint: disable=too-many-locals,too-many-branches,too-many-statements
+            def gpu_worker(
+                gpu_id: int,
+                work_queue: Queue[int | None],
+                iter_val: int = outer_iteration,
+                queue: Queue[dict[str, Any]] = result_queue,
+            ) -> None:
+                device = device_list[gpu_id]
+                local_template = templates[gpu_id]
+                local_setup = setup_states[gpu_id]
+
+                while True:
+                    i = work_queue.get()
+                    if i is None:  # Sentinel value
+                        break
+
+                    results_path = results_files[i]
+
+                    micrograph_loss, astigmatism_result = _micrograph_loop(
+                        i=i,
+                        results_path=results_path,
+                        template=local_template,
+                        template_box_size=template_box_size,
+                        device=device,
+                        batch_size=batch_size,
+                        per_micrograph_iterations=per_micrograph_iterations,
+                        outer_iteration=iter_val,
+                        refine_anisotropic_mag=refine_anisotropic_mag,
+                        refine_astigmatism=refine_astigmatism,
+                        refine_beam_tilt=refine_beam_tilt,
+                        apply_global_filtering=apply_global_filtering,
+                        preprocessing_filters=preprocessing_filters,
+                        convergence_threshold=convergence_threshold,
+                        num_results_files=num_micrographs,
+                        initial_astigmatism_angle=initial_astigmatism_angle,
+                        initial_astigmatism_magnitude=initial_astigmatism_magnitude,
+                        setup_state=local_setup,
+                    )
+
+                    if micrograph_loss.numel() > 1:
+                        loss_val = micrograph_loss.mean().item()
+                    elif hasattr(micrograph_loss, "item"):
+                        loss_val = micrograph_loss.item()
+                    else:
+                        loss_val = float(micrograph_loss)
+
+                    print(
+                        f"  GPU {gpu_id}: Micrograph {i + 1}/{num_micrographs} "
+                        f"loss: {loss_val:.6f}"
+                    )
+
+                    # Collect gradients from GPU-local parameters for
+                    # dataset-level optimization. _micrograph_loop may have
+                    # already computed gradients if retain_graph=True was used.
+                    # We need to compute them here to ensure they're available
+                    # for the final loss value.
+                    grads = {}
+                    if refine_anisotropic_mag or refine_beam_tilt:
+                        # Check if computation graph is still intact
+                        if micrograph_loss.requires_grad:
+                            # Compute gradients for dataset-level parameters
+                            # using the final loss
+                            if micrograph_loss.numel() > 1:
+                                micrograph_loss_scalar = micrograph_loss.mean()
+                            else:
+                                micrograph_loss_scalar = micrograph_loss
+                            scaled_loss = micrograph_loss_scalar / num_micrographs
+
+                            # Zero any existing gradients first
+                            if (
+                                refine_anisotropic_mag
+                                and local_setup["anistropic_mag"].requires_grad
+                            ):
+                                if local_setup["anistropic_mag"].grad is not None:
+                                    local_setup["anistropic_mag"].grad.zero_()
+                            if refine_beam_tilt:
+                                z31c = local_setup["odd_zernikes"]["Z31c"]
+                                if z31c.requires_grad and z31c.grad is not None:
+                                    z31c.grad.zero_()
+                                z31s = local_setup["odd_zernikes"]["Z31s"]
+                                if z31s.requires_grad and z31s.grad is not None:
+                                    z31s.grad.zero_()
+
+                            # Compute gradients
+                            scaled_loss.backward(retain_graph=False)
+
+                            # Collect gradients
+                            if (
+                                refine_anisotropic_mag
+                                and local_setup["anistropic_mag"].requires_grad
+                            ):
+                                aniso_grad = local_setup["anistropic_mag"].grad
+                                if aniso_grad is not None:
+                                    grads["anistropic_mag"] = (
+                                        aniso_grad.detach().clone().cpu()
+                                    )
+                                    local_setup["anistropic_mag"].grad = None
+
+                            if refine_beam_tilt:
+                                z31c = local_setup["odd_zernikes"]["Z31c"]
+                                if z31c.requires_grad and z31c.grad is not None:
+                                    grads["Z31c"] = z31c.grad.detach().clone().cpu()
+                                    z31c.grad = None
+                                z31s = local_setup["odd_zernikes"]["Z31s"]
+                                if z31s.requires_grad and z31s.grad is not None:
+                                    grads["Z31s"] = z31s.grad.detach().clone().cpu()
+                                    z31s.grad = None
+
+                    queue.put(
+                        {
+                            "index": i,
+                            "loss": loss_val,
+                            "astigmatism_angle": astigmatism_result["angle"],
+                            "astigmatism_magnitude": astigmatism_result["magnitude"],
+                            "grads": grads,
+                        }
+                    )
+
+                    # Free memory
+                    del micrograph_loss
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+
+            # Start all worker threads
+            threads = []
+            for gpu_id in range(num_gpus):
+                thread = Thread(target=gpu_worker, args=(gpu_id, work_queues[gpu_id]))
+                threads.append(thread)
+                thread.start()
+
+            # Wait for all threads to complete
+            for thread in threads:
+                thread.join()
+
+            # Collect all results
+            all_results = []
+            while not result_queue.empty():
+                all_results.append(result_queue.get())
+
+            # Sort by index to maintain order
+            all_results.sort(key=lambda x: x["index"])
+
+            # Process results and accumulate gradients
+            for result in all_results:
+                i = result["index"]
+                loss_val = result["loss"]
+
+                astigmatism_angle_all[i] = result["astigmatism_angle"].to(
+                    primary_device
+                )
+                astigmatism_magnitude_all[i] = result["astigmatism_magnitude"].to(
+                    primary_device
+                )
+
+                if i not in micrograph_losses:
+                    micrograph_losses[i] = []
+                micrograph_losses[i].append((outer_iteration, loss_val))
+                dataset_loss_value += loss_val
+
+                # Accumulate gradients from GPU-local parameters to master parameters
+                grads = result.get("grads", {})
+                if refine_anisotropic_mag and "anistropic_mag" in grads:
+                    if anistropic_mag.grad is None:
+                        anistropic_mag.grad = grads["anistropic_mag"].to(primary_device)
+                    else:
+                        anistropic_mag.grad.add_(
+                            grads["anistropic_mag"].to(primary_device)
+                        )
+
+                if refine_beam_tilt:
+                    if "Z31c" in grads:
+                        if odd_zernikes["Z31c"].grad is None:
+                            odd_zernikes["Z31c"].grad = grads["Z31c"].to(primary_device)
+                        else:
+                            odd_zernikes["Z31c"].grad.add_(
+                                grads["Z31c"].to(primary_device)
+                            )
+                    if "Z31s" in grads:
+                        if odd_zernikes["Z31s"].grad is None:
+                            odd_zernikes["Z31s"].grad = grads["Z31s"].to(primary_device)
+                        else:
+                            odd_zernikes["Z31s"].grad.add_(
+                                grads["Z31s"].to(primary_device)
+                            )
+
+        else:
+            # Single GPU path
+            for i, results_path in enumerate(results_files):
+                micrograph_loss, astigmatism_result = _micrograph_loop(
+                    i=i,
+                    results_path=results_path,
+                    template=template,
+                    template_box_size=template_box_size,
+                    device=primary_device,
+                    batch_size=batch_size,
+                    per_micrograph_iterations=per_micrograph_iterations,
+                    outer_iteration=outer_iteration,
+                    refine_anisotropic_mag=refine_anisotropic_mag,
+                    refine_astigmatism=refine_astigmatism,
+                    refine_beam_tilt=refine_beam_tilt,
+                    apply_global_filtering=apply_global_filtering,
+                    preprocessing_filters=preprocessing_filters,
+                    convergence_threshold=convergence_threshold,
+                    num_results_files=num_micrographs,
+                    initial_astigmatism_angle=initial_astigmatism_angle,
+                    initial_astigmatism_magnitude=initial_astigmatism_magnitude,
+                    setup_state=setup_state,
+                )
+
+                astigmatism_angle_all[i] = astigmatism_result["angle"]
+                astigmatism_magnitude_all[i] = astigmatism_result["magnitude"]
+
+                if i not in micrograph_losses:
+                    micrograph_losses[i] = []
+
+                if micrograph_loss.numel() > 1:
+                    loss_val = micrograph_loss.mean().item()
+                elif hasattr(micrograph_loss, "item"):
+                    loss_val = micrograph_loss.item()
+                else:
+                    loss_val = float(micrograph_loss)
+                micrograph_losses[i].append((outer_iteration, loss_val))
+                dataset_loss_value += loss_val
+
+                if refine_anisotropic_mag or refine_beam_tilt:
+                    if micrograph_loss.numel() > 1:
+                        micrograph_loss_scalar = micrograph_loss.mean()
+                    else:
+                        micrograph_loss_scalar = micrograph_loss
+                    scaled_loss = micrograph_loss_scalar / num_micrographs
+                    scaled_loss.backward()
+
+                print(f"  Micrograph {i + 1}/{num_micrographs} loss: {loss_val:.6f}")
+
+                if primary_device.type == "cuda":
+                    torch.cuda.empty_cache()
+
+        # Optimize dataset-level parameters
+        if refine_anisotropic_mag and optimizer_aniso is not None:
+            optimizer_aniso.step()
+            # Print mag matrix after each update
+            print("\nMagnification matrix after update:")
+            print(anistropic_mag.detach().cpu().numpy())
+        if refine_beam_tilt and optimizer_beam_tilt is not None:
+            optimizer_beam_tilt.step()
+
+        # Update GPU-local copies with new master parameter values
+        if num_gpus > 1:
+            for gpu_id, device in enumerate(device_list):
+                if refine_anisotropic_mag:
+                    setup_states[gpu_id]["anistropic_mag"].data.copy_(
+                        anistropic_mag.data.to(device)
+                    )
+                if refine_beam_tilt:
+                    setup_states[gpu_id]["odd_zernikes"]["Z31c"].data.copy_(
+                        odd_zernikes["Z31c"].data.to(device)
+                    )
+                    setup_states[gpu_id]["odd_zernikes"]["Z31s"].data.copy_(
+                        odd_zernikes["Z31s"].data.to(device)
+                    )
+
+        # Print statistics
+        z31c = odd_zernikes["Z31c"]
+        z31c_val = z31c.item() if hasattr(z31c, "item") else float(z31c)
+        z31s = odd_zernikes["Z31s"]
+        z31s_val = z31s.item() if hasattr(z31s, "item") else float(z31s)
+        print(f"Zernike coefficients: Z31c={z31c_val:.6f}, Z31s={z31s_val:.6f}")
+
+        avg_dataset_loss = dataset_loss_value / num_micrographs
+        print(
+            f"Dataset iteration {outer_iteration + 1}/"
+            f"{per_dataset_iterations} loss: {avg_dataset_loss:.6f}\n"
+        )
+
+        dataset_losses.append((outer_iteration, avg_dataset_loss))
+
+        # Check convergence
+        loss_history.append(avg_dataset_loss)
+        if len(loss_history) >= 6:
+            converged = True
+            for j in range(len(loss_history) - 5, len(loss_history) - 1):
+                abs_change = abs(loss_history[j + 1] - loss_history[j])
+                if abs_change > convergence_threshold:
+                    converged = False
+                    break
+
+            if converged:
+                last_change = abs(loss_history[-1] - loss_history[-2])
+                print(
+                    f"Converged: absolute change in dataset loss "
+                    f"({last_change:.6f}) <= threshold "
+                    f"({convergence_threshold:.6f}) for 5 consecutive "
+                    f"iterations. Stopping early."
+                )
+                break
+
+            loss_history = loss_history[-6:]
+
+    if refine_anisotropic_mag:
+        output_mag_matrix(anistropic_mag)
+
+    return {
+        "anistropic_mag": anistropic_mag.detach(),
+        "odd_zernikes": {
+            "Z31c": odd_zernikes["Z31c"].detach(),
+            "Z31s": odd_zernikes["Z31s"].detach(),
+        },
+        "astigmatism_angle": astigmatism_angle_all.detach(),
+        "astigmatism_magnitude": astigmatism_magnitude_all.detach(),
+        "dataset_losses": dataset_losses,
+        "micrograph_losses": micrograph_losses,
+    }
+
+
+# Note: Include your original _micrograph_loop function here
 
 
 # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-branches,too-many-statements
@@ -618,220 +1064,3 @@ def _micrograph_loop(
         torch.cuda.empty_cache()
 
     return micrograph_loss, astigmatism_result
-
-
-# pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-branches,too-many-statements
-def _dataset_loop(
-    results_files: list[str],
-    template: torch.Tensor,
-    template_box_size: tuple[int, int],
-    device: torch.device,
-    batch_size: int,
-    per_micrograph_iterations: int,
-    per_dataset_iterations: int,
-    refine_anisotropic_mag: bool,
-    refine_astigmatism: bool,
-    refine_beam_tilt: bool,
-    apply_global_filtering: bool,
-    preprocessing_filters: PreprocessingFilters,
-    convergence_threshold: float,
-    initial_astigmatism_angle: torch.Tensor | None,
-    initial_astigmatism_magnitude: torch.Tensor | None,
-    setup_state: dict[str, Any],
-) -> dict[str, Any]:
-    """Run the outer dataset loop for dataset-level optimization.
-
-    Parameters
-    ----------
-    results_files : list[str]
-        The list of results file paths.
-    template : torch.Tensor
-        The template volume.
-    template_box_size : tuple[int, int]
-        The box size of the template.
-    device : torch.device
-        The device to use for computation.
-    batch_size : int
-        The batch size to use for computation.
-    per_micrograph_iterations : int
-        The number of iterations to run per micrograph.
-    per_dataset_iterations : int
-        The number of iterations to run per dataset.
-    refine_anisotropic_mag : bool
-        Whether to refine the anisotropic magnitude.
-    refine_astigmatism : bool
-        Whether to refine the astigmatism.
-    refine_beam_tilt : bool
-        Whether to refine the beam tilt.
-    apply_global_filtering : bool
-        Whether to apply global filtering to the micrographs.
-    preprocessing_filters : PreprocessingFilters
-        Filters to apply to the particle images.
-    convergence_threshold : float
-        Convergence threshold for early stopping.
-    initial_astigmatism_angle : torch.Tensor | None
-        Initial astigmatism angle tensor.
-    initial_astigmatism_magnitude : torch.Tensor | None
-        Initial astigmatism magnitude tensor.
-    setup_state : dict[str, Any]
-        Setup state from _setup_refinement.
-
-    Returns
-    -------
-    dict[str, Any]
-        Refined CTF parameters and loss tracking data.
-    """
-    anistropic_mag = setup_state["anistropic_mag"]
-    odd_zernikes = setup_state["odd_zernikes"]
-    astigmatism_angle_all = setup_state["astigmatism_angle_all"]
-    astigmatism_magnitude_all = setup_state["astigmatism_magnitude_all"]
-    optimizer_aniso = setup_state["optimizer_aniso"]
-    optimizer_beam_tilt = setup_state["optimizer_beam_tilt"]
-
-    # Track loss history for convergence checking
-    loss_history: list[float] = []
-    # Track losses for CSV output
-    dataset_losses: list[tuple[int, float]] = []
-    micrograph_losses: dict[int, list[tuple[int, float]]] = {}
-
-    num_micrographs = len(results_files)
-
-    for outer_iteration in range(per_dataset_iterations):
-        # Track accumulated loss value (scalar, no gradients) for logging
-        dataset_loss_value: float = 0.0
-
-        # Zero gradients at the start of each outer iteration
-        if refine_anisotropic_mag and optimizer_aniso is not None:
-            optimizer_aniso.zero_grad()
-        if refine_beam_tilt and optimizer_beam_tilt is not None:
-            optimizer_beam_tilt.zero_grad()
-
-        # Loop through results files
-        for i, results_path in enumerate(results_files):
-            micrograph_loss, astigmatism_result = _micrograph_loop(
-                i=i,
-                results_path=results_path,
-                template=template,
-                template_box_size=template_box_size,
-                device=device,
-                batch_size=batch_size,
-                per_micrograph_iterations=per_micrograph_iterations,
-                outer_iteration=outer_iteration,
-                refine_anisotropic_mag=refine_anisotropic_mag,
-                refine_astigmatism=refine_astigmatism,
-                refine_beam_tilt=refine_beam_tilt,
-                apply_global_filtering=apply_global_filtering,
-                preprocessing_filters=preprocessing_filters,
-                convergence_threshold=convergence_threshold,
-                num_results_files=num_micrographs,
-                initial_astigmatism_angle=initial_astigmatism_angle,
-                initial_astigmatism_magnitude=initial_astigmatism_magnitude,
-                setup_state=setup_state,
-            )
-
-            # Store final astigmatism values
-            astigmatism_angle_all[i] = astigmatism_result["angle"]
-            astigmatism_magnitude_all[i] = astigmatism_result["magnitude"]
-
-            # Track micrograph loss for CSV output
-            if i not in micrograph_losses:
-                micrograph_losses[i] = []
-            if micrograph_loss.numel() > 1:
-                loss_val = micrograph_loss.mean().item()
-            else:
-                if hasattr(micrograph_loss, "item"):
-                    loss_val = micrograph_loss.item()
-                else:
-                    loss_val = float(micrograph_loss)
-            micrograph_losses[i].append((outer_iteration, loss_val))
-            dataset_loss_value += loss_val
-
-            # Accumulate gradients for dataset-level optimizers
-            # Use gradient accumulation: backward immediately, don't accumulate tensors
-            if refine_anisotropic_mag or refine_beam_tilt:
-                # Ensure micrograph_loss is a scalar
-                if micrograph_loss.numel() > 1:
-                    micrograph_loss_scalar = micrograph_loss.mean()
-                else:
-                    micrograph_loss_scalar = micrograph_loss
-
-                # Scale by 1/num_micrographs for proper gradient accumulation
-                scaled_loss = micrograph_loss_scalar / num_micrographs
-
-                # Backward pass accumulates gradients in-place
-                scaled_loss.backward()
-
-                # Print micrograph loss
-                print(f"  Micrograph {i + 1}/{num_micrographs} loss: {loss_val:.6f}")
-
-                # Clear the computation graph for this micrograph to free memory
-                del micrograph_loss_scalar, scaled_loss
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
-
-        # Optimize dataset-level parameters (outer loop)
-        # Gradients have already been accumulated via backward() calls above
-        if refine_anisotropic_mag and optimizer_aniso is not None:
-            optimizer_aniso.step()
-
-        if refine_beam_tilt and optimizer_beam_tilt is not None:
-            optimizer_beam_tilt.step()
-            # Print Zernike coefficients after optimization
-            if hasattr(odd_zernikes["Z31c"], "item"):
-                z31c_val = odd_zernikes["Z31c"].item()
-            else:
-                z31c_val = float(odd_zernikes["Z31c"])
-            if hasattr(odd_zernikes["Z31s"], "item"):
-                z31s_val = odd_zernikes["Z31s"].item()
-            else:
-                z31s_val = float(odd_zernikes["Z31s"])
-            print(f"Zernike coefficients: Z31c={z31c_val:.6f}, Z31s={z31s_val:.6f}")
-
-        # Print dataset-level loss after each outer iteration
-        avg_dataset_loss = dataset_loss_value / num_micrographs
-        print(
-            f"Dataset iteration {outer_iteration + 1}/"
-            f"{per_dataset_iterations} loss: {avg_dataset_loss:.6f}"
-        )
-        # Track dataset loss for CSV output
-        dataset_losses.append((outer_iteration, avg_dataset_loss))
-
-        # Check for convergence based on dataset loss (end of outer loop)
-        loss_history.append(avg_dataset_loss)
-        if len(loss_history) >= 6:  # Need at least 6 to check last 5 changes
-            # Check if absolute change has been less than threshold
-            # for the last 5 consecutive iterations
-            converged = True
-            for j in range(len(loss_history) - 5, len(loss_history) - 1):
-                abs_change = abs(loss_history[j + 1] - loss_history[j])
-                if abs_change > convergence_threshold:
-                    converged = False
-                    break
-
-            if converged:
-                last_change = abs(loss_history[-1] - loss_history[-2])
-                print(
-                    f"Converged: absolute change in dataset loss "
-                    f"({last_change:.6f}) <= threshold "
-                    f"({convergence_threshold:.6f}) for 5 consecutive "
-                    f"iterations. Stopping early."
-                )
-                break
-            # Keep only last 6 values for efficiency
-            loss_history = loss_history[-6:]
-
-        # Output magnification matrix information
-        if refine_anisotropic_mag:
-            output_mag_matrix(anistropic_mag)
-
-    return {
-        "anistropic_mag": anistropic_mag.detach(),
-        "odd_zernikes": {
-            "Z31c": odd_zernikes["Z31c"].detach(),
-            "Z31s": odd_zernikes["Z31s"].detach(),
-        },
-        "astigmatism_angle": astigmatism_angle_all.detach(),
-        "astigmatism_magnitude": astigmatism_magnitude_all.detach(),
-        "dataset_losses": dataset_losses,
-        "micrograph_losses": micrograph_losses,
-    }

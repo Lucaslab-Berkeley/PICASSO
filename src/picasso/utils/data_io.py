@@ -205,7 +205,7 @@ def read_refined_ctf_params(
         raise FileNotFoundError(f"Pickle file not found: {pkl_path}")
 
     with open(pkl_path, "rb") as f:
-        refined_ctf_params = pickle.load(f)
+        refined_ctf_params: dict[str, Any] = pickle.load(f)
 
     return refined_ctf_params
 

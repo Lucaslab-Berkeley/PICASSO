@@ -34,7 +34,7 @@ computational_config:
   #   - An integer (e.g., 0) for GPU ID
   #   - A string like "cuda:0" for GPU ID
   #   - "cpu" for CPU computation
-  gpu_id: 0
+  gpu_ids: "all"
 
 # CTF refinement configuration
 ctf_refine_config:
