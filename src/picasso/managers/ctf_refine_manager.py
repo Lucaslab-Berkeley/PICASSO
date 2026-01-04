@@ -1,7 +1,7 @@
 """Manager for refining CTF parameters for 2D in situ data."""
 
 import os
-import pickle
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +16,13 @@ from picasso.config import (
 )
 from picasso.core import core_refine_ctf
 from picasso.utils.custom_types import BaseModelPICASSO
-from picasso.utils.data_io import get_results_files, load_template_tensor
+from picasso.utils.data_io import (
+    get_results_files,
+    load_template_tensor,
+    read_refined_ctf_params,
+    write_loss_csvs,
+    write_refined_ctf_params,
+)
 
 
 class CTFRefineManager(BaseModelPICASSO):
@@ -109,73 +115,11 @@ class CTFRefineManager(BaseModelPICASSO):
 
         output_path = Path(self.output_config.output_directory) / filename
 
-        # Check if file exists and overwrite is not allowed
-        if not self.output_config.allow_file_overwrite and output_path.exists():
-            raise ValueError(
-                f"File '{output_path}' already exists, but "
-                "'allow_file_overwrite' is False. Set "
-                "'allow_file_overwrite' to True to permit overwriting."
-            )
-
-        # Create directory if it doesn't exist
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Check write permissions
-        if not os.access(output_path.parent, os.W_OK):
-            raise ValueError(
-                f"Directory '{output_path.parent}' does not permit writing."
-            )
-
-        # Write the parameters using pickle
-        with open(output_path, "wb") as f:
-            pickle.dump(refined_ctf_params, f)
-
-        # Also write a human-readable text file
-        txt_output_path = output_path.with_suffix(".txt")
-        with open(txt_output_path, "w") as f:
-            f.write("Refined CTF Parameters\n")
-            f.write("=" * 50 + "\n\n")
-
-            if "anistropic_mag" in refined_ctf_params:
-                f.write("Anisotropic Magnification Matrix:\n")
-                mag_matrix = refined_ctf_params["anistropic_mag"]
-                if isinstance(mag_matrix, torch.Tensor):
-                    mag_matrix_np = mag_matrix.cpu().numpy()
-                    f.write(f"{mag_matrix_np}\n\n")
-                else:
-                    f.write(f"{mag_matrix}\n\n")
-
-            if "odd_zernikes" in refined_ctf_params:
-                f.write("Odd Zernike Coefficients:\n")
-                zernikes = refined_ctf_params["odd_zernikes"]
-                for key, value in zernikes.items():
-                    if isinstance(value, torch.Tensor):
-                        val = value.cpu().item()
-                    else:
-                        val = value
-                    f.write(f"  {key}: {val:.6f}\n")
-                f.write("\n")
-
-            if "astigmatism_angle" in refined_ctf_params:
-                f.write("Astigmatism Angles (per micrograph):\n")
-                angles = refined_ctf_params["astigmatism_angle"]
-                if isinstance(angles, torch.Tensor):
-                    angles_np = angles.cpu().numpy()
-                    for i, angle in enumerate(angles_np):
-                        f.write(f"  Micrograph {i + 1}: {angle:.6f}\n")
-                else:
-                    f.write(f"{angles}\n")
-                f.write("\n")
-
-            if "astigmatism_magnitude" in refined_ctf_params:
-                f.write("Astigmatism Magnitudes (per micrograph):\n")
-                magnitudes = refined_ctf_params["astigmatism_magnitude"]
-                if isinstance(magnitudes, torch.Tensor):
-                    magnitudes_np = magnitudes.cpu().numpy()
-                    for i, mag in enumerate(magnitudes_np):
-                        f.write(f"  Micrograph {i + 1}: {mag:.6f}\n")
-                else:
-                    f.write(f"{magnitudes}\n")
+        write_refined_ctf_params(
+            refined_ctf_params=refined_ctf_params,
+            output_path=output_path,
+            allow_file_overwrite=self.output_config.allow_file_overwrite,
+        )
 
     def refine_ctf(
         self,
@@ -183,6 +127,7 @@ class CTFRefineManager(BaseModelPICASSO):
         initial_odd_zernikes: dict[str, torch.Tensor] | None = None,
         initial_astigmatism_angle: torch.Tensor | None = None,
         initial_astigmatism_magnitude: torch.Tensor | None = None,
+        initial_params_pkl_path: str | os.PathLike | Path | None = None,
     ) -> dict[str, Any]:
         """Refine the CTF parameters for the micrographs.
 
@@ -196,6 +141,10 @@ class CTFRefineManager(BaseModelPICASSO):
             Initial astigmatism angles for each micrograph. Defaults to None.
         initial_astigmatism_magnitude : torch.Tensor | None, optional
             Initial astigmatism magnitudes for each micrograph. Defaults to None.
+        initial_params_pkl_path : str | os.PathLike | Path | None, optional
+            Path to a pickle file containing initial CTF parameters.
+            If provided and explicit parameters are also given, explicit
+            parameters take precedence with a warning.
 
         Returns
         -------
@@ -208,12 +157,64 @@ class CTFRefineManager(BaseModelPICASSO):
         """
         backend_kwargs = self.setup_backend_kwargs()
 
+        # Load initial parameters from pkl file if provided
+        pkl_params: dict[str, Any] | None = None
+        if initial_params_pkl_path is not None:
+            pkl_params = read_refined_ctf_params(initial_params_pkl_path)
+
+        # Check for conflicts and use explicit parameters over pkl
+        has_explicit_params = any(
+            [
+                initial_mag_matrix is not None,
+                initial_odd_zernikes is not None,
+                initial_astigmatism_angle is not None,
+                initial_astigmatism_magnitude is not None,
+            ]
+        )
+
+        if pkl_params is not None and has_explicit_params:
+            warnings.warn(
+                "Both pkl file and explicit initial parameters provided. "
+                "Using explicitly provided parameters over pkl file values.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        # Use explicit parameters if provided, otherwise use pkl file values
+        final_initial_mag_matrix = initial_mag_matrix
+        if final_initial_mag_matrix is None and pkl_params is not None:
+            final_initial_mag_matrix = pkl_params.get("anistropic_mag")
+
+        final_initial_odd_zernikes = initial_odd_zernikes
+        if final_initial_odd_zernikes is None and pkl_params is not None:
+            final_initial_odd_zernikes = pkl_params.get("odd_zernikes")
+
+        final_initial_astigmatism_angle = initial_astigmatism_angle
+        if final_initial_astigmatism_angle is None and pkl_params is not None:
+            final_initial_astigmatism_angle = pkl_params.get("astigmatism_angle")
+
+        final_initial_astigmatism_magnitude = initial_astigmatism_magnitude
+        if final_initial_astigmatism_magnitude is None and pkl_params is not None:
+            final_initial_astigmatism_magnitude = pkl_params.get(
+                "astigmatism_magnitude"
+            )
+
         refined_ctf_params = core_refine_ctf(
             **backend_kwargs,
-            initial_mag_matrix=initial_mag_matrix,
-            initial_odd_zernikes=initial_odd_zernikes,
-            initial_astigmatism_angle=initial_astigmatism_angle,
-            initial_astigmatism_magnitude=initial_astigmatism_magnitude,
+            initial_mag_matrix=final_initial_mag_matrix,
+            initial_odd_zernikes=final_initial_odd_zernikes,
+            initial_astigmatism_angle=final_initial_astigmatism_angle,
+            initial_astigmatism_magnitude=final_initial_astigmatism_magnitude,
         )
+
+        # Write loss CSV files if requested
+        if (
+            self.output_config.output_losses
+            and self.output_config.output_directory is not None
+        ):
+            write_loss_csvs(
+                refined_ctf_params=refined_ctf_params,
+                output_directory=self.output_config.output_directory,
+            )
 
         return refined_ctf_params

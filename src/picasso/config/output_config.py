@@ -41,6 +41,7 @@ class OutputConfig(BaseModelPICASSO):
 
     allow_file_overwrite: bool = True
     output_directory: str | None = None
+    output_losses: bool = False
 
     @model_validator(mode="after")  # type: ignore
     def validate_paths(self) -> Self:
