@@ -612,6 +612,11 @@ def _micrograph_loop(
         astigmatism_result["angle"] = astigmatism_angle
         astigmatism_result["magnitude"] = astigmatism_magnitude
 
+    # Explicitly free particle stack and clear cache to reduce memory usage
+    del particle_stack, euler_angles, particle_backend_kwargs
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
     return micrograph_loss, astigmatism_result
 
 
@@ -689,8 +694,18 @@ def _dataset_loop(
     dataset_losses: list[tuple[int, float]] = []
     micrograph_losses: dict[int, list[tuple[int, float]]] = {}
 
+    num_micrographs = len(results_files)
+
     for outer_iteration in range(per_dataset_iterations):
-        dataset_loss: torch.Tensor | None = None
+        # Track accumulated loss value (scalar, no gradients) for logging
+        dataset_loss_value: float = 0.0
+
+        # Zero gradients at the start of each outer iteration
+        if refine_anisotropic_mag and optimizer_aniso is not None:
+            optimizer_aniso.zero_grad()
+        if refine_beam_tilt and optimizer_beam_tilt is not None:
+            optimizer_beam_tilt.zero_grad()
+
         # Loop through results files
         for i, results_path in enumerate(results_files):
             micrograph_loss, astigmatism_result = _micrograph_loop(
@@ -708,7 +723,7 @@ def _dataset_loop(
                 apply_global_filtering=apply_global_filtering,
                 preprocessing_filters=preprocessing_filters,
                 convergence_threshold=convergence_threshold,
-                num_results_files=len(results_files),
+                num_results_files=num_micrographs,
                 initial_astigmatism_angle=initial_astigmatism_angle,
                 initial_astigmatism_magnitude=initial_astigmatism_magnitude,
                 setup_state=setup_state,
@@ -729,37 +744,37 @@ def _dataset_loop(
                 else:
                     loss_val = float(micrograph_loss)
             micrograph_losses[i].append((outer_iteration, loss_val))
+            dataset_loss_value += loss_val
 
-            # Accumulate loss for dataset-level optimizers
-            # Need to keep gradients for dataset-level parameters
+            # Accumulate gradients for dataset-level optimizers
+            # Use gradient accumulation: backward immediately, don't accumulate tensors
             if refine_anisotropic_mag or refine_beam_tilt:
                 # Ensure micrograph_loss is a scalar
                 if micrograph_loss.numel() > 1:
-                    micrograph_loss = micrograph_loss.mean()
-                if dataset_loss is None:
-                    dataset_loss = micrograph_loss
+                    micrograph_loss_scalar = micrograph_loss.mean()
                 else:
-                    dataset_loss = dataset_loss + micrograph_loss
+                    micrograph_loss_scalar = micrograph_loss
+
+                # Scale by 1/num_micrographs for proper gradient accumulation
+                scaled_loss = micrograph_loss_scalar / num_micrographs
+
+                # Backward pass accumulates gradients in-place
+                scaled_loss.backward()
+
                 # Print micrograph loss
-                print(f"  Micrograph {i + 1}/{len(results_files)} loss: {loss_val:.6f}")
+                print(f"  Micrograph {i + 1}/{num_micrographs} loss: {loss_val:.6f}")
+
+                # Clear the computation graph for this micrograph to free memory
+                del micrograph_loss_scalar, scaled_loss
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
 
         # Optimize dataset-level parameters (outer loop)
-        if (
-            refine_anisotropic_mag
-            and dataset_loss is not None
-            and optimizer_aniso is not None
-        ):
-            optimizer_aniso.zero_grad()
-            dataset_loss.backward()
+        # Gradients have already been accumulated via backward() calls above
+        if refine_anisotropic_mag and optimizer_aniso is not None:
             optimizer_aniso.step()
 
-        if (
-            refine_beam_tilt
-            and dataset_loss is not None
-            and optimizer_beam_tilt is not None
-        ):
-            optimizer_beam_tilt.zero_grad()
-            dataset_loss.backward()
+        if refine_beam_tilt and optimizer_beam_tilt is not None:
             optimizer_beam_tilt.step()
             # Print Zernike coefficients after optimization
             if hasattr(odd_zernikes["Z31c"], "item"):
@@ -773,41 +788,37 @@ def _dataset_loop(
             print(f"Zernike coefficients: Z31c={z31c_val:.6f}, Z31s={z31s_val:.6f}")
 
         # Print dataset-level loss after each outer iteration
-        if dataset_loss is not None:
-            if hasattr(dataset_loss, "item"):
-                loss_val = dataset_loss.item()
-            else:
-                loss_val = float(dataset_loss)
-            print(
-                f"Dataset iteration {outer_iteration + 1}/"
-                f"{per_dataset_iterations} loss: {loss_val:.6f}"
-            )
-            # Track dataset loss for CSV output
-            dataset_losses.append((outer_iteration, loss_val))
+        avg_dataset_loss = dataset_loss_value / num_micrographs
+        print(
+            f"Dataset iteration {outer_iteration + 1}/"
+            f"{per_dataset_iterations} loss: {avg_dataset_loss:.6f}"
+        )
+        # Track dataset loss for CSV output
+        dataset_losses.append((outer_iteration, avg_dataset_loss))
 
-            # Check for convergence based on dataset loss (end of outer loop)
-            loss_history.append(loss_val)
-            if len(loss_history) >= 6:  # Need at least 6 to check last 5 changes
-                # Check if absolute change has been less than threshold
-                # for the last 5 consecutive iterations
-                converged = True
-                for j in range(len(loss_history) - 5, len(loss_history) - 1):
-                    abs_change = abs(loss_history[j + 1] - loss_history[j])
-                    if abs_change > convergence_threshold:
-                        converged = False
-                        break
-
-                if converged:
-                    last_change = abs(loss_history[-1] - loss_history[-2])
-                    print(
-                        f"Converged: absolute change in dataset loss "
-                        f"({last_change:.6f}) <= threshold "
-                        f"({convergence_threshold:.6f}) for 5 consecutive "
-                        f"iterations. Stopping early."
-                    )
+        # Check for convergence based on dataset loss (end of outer loop)
+        loss_history.append(avg_dataset_loss)
+        if len(loss_history) >= 6:  # Need at least 6 to check last 5 changes
+            # Check if absolute change has been less than threshold
+            # for the last 5 consecutive iterations
+            converged = True
+            for j in range(len(loss_history) - 5, len(loss_history) - 1):
+                abs_change = abs(loss_history[j + 1] - loss_history[j])
+                if abs_change > convergence_threshold:
+                    converged = False
                     break
-                # Keep only last 6 values for efficiency
-                loss_history = loss_history[-6:]
+
+            if converged:
+                last_change = abs(loss_history[-1] - loss_history[-2])
+                print(
+                    f"Converged: absolute change in dataset loss "
+                    f"({last_change:.6f}) <= threshold "
+                    f"({convergence_threshold:.6f}) for 5 consecutive "
+                    f"iterations. Stopping early."
+                )
+                break
+            # Keep only last 6 values for efficiency
+            loss_history = loss_history[-6:]
 
         # Output magnification matrix information
         if refine_anisotropic_mag:
