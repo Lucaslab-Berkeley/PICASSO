@@ -14,7 +14,7 @@ from picasso.config import (
     InputConfig,
     OutputConfig,
 )
-from picasso.core import core_refine_ctf
+from picasso.core import core_refine_ctf, core_refine_ctf_lbfgs
 from picasso.utils.custom_types import BaseModelPICASSO
 from picasso.utils.data_io import (
     get_results_files,
@@ -203,7 +203,13 @@ class CTFRefineManager(BaseModelPICASSO):
                 "astigmatism_magnitude"
             )
 
-        refined_ctf_params = core_refine_ctf(
+        # Choose core function based on optimizer type from config
+        if self.ctf_refine_config.optimizer == "lbfgs":
+            core_function = core_refine_ctf_lbfgs
+        else:
+            core_function = core_refine_ctf
+
+        refined_ctf_params = core_function(
             **backend_kwargs,
             initial_mag_matrix=final_initial_mag_matrix,
             initial_odd_zernikes=final_initial_odd_zernikes,
