@@ -348,6 +348,8 @@ def get_loss_scalar_tensor(loss: torch.Tensor) -> torch.Tensor:
 def create_optimizer_aniso(
     anistropic_mag: torch.Tensor,
     optimizer_type: str = "adam",
+    lr: float = 0.005,
+    max_eval: int = 5,
 ) -> torch.optim.Optimizer | None:
     """Create optimizer for anisotropic magnification.
 
@@ -357,6 +359,10 @@ def create_optimizer_aniso(
         Anisotropic magnification matrix parameter.
     optimizer_type : str, optional
         Type of optimizer to create. Either "adam" or "lbfgs". Defaults to "adam".
+    lr : float, optional
+        Learning rate for the optimizer. Defaults to 0.005.
+    max_eval : int, optional
+        Maximum number of closure evaluations for L-BFGS. Defaults to 5.
 
     Returns
     -------
@@ -366,12 +372,12 @@ def create_optimizer_aniso(
     if optimizer_type == "lbfgs":
         return torch.optim.LBFGS(
             [anistropic_mag],
-            lr=0.005,
+            lr=lr,
             line_search_fn="strong_wolfe",
-            max_eval=5,  # Limit closure calls to prevent excessive recomputation
+            max_eval=max_eval,
         )
     elif optimizer_type == "adam":
-        return torch.optim.Adam([anistropic_mag], lr=0.005)
+        return torch.optim.Adam([anistropic_mag], lr=lr)
     else:
         raise ValueError(f"Unknown optimizer type: {optimizer_type}")
 
@@ -379,6 +385,8 @@ def create_optimizer_aniso(
 def create_optimizer_beam_tilt(
     odd_zernikes: dict[str, torch.Tensor],
     optimizer_type: str = "adam",
+    lr: float = 1.0,
+    max_eval: int = 5,
 ) -> torch.optim.Optimizer | None:
     """Create optimizer for beam tilt (odd Zernike coefficients).
 
@@ -388,6 +396,10 @@ def create_optimizer_beam_tilt(
         Dictionary with "Z31c" and "Z31s" keys containing parameters.
     optimizer_type : str, optional
         Type of optimizer to create. Either "adam" or "lbfgs". Defaults to "adam".
+    lr : float, optional
+        Learning rate for the optimizer. Defaults to 1.0.
+    max_eval : int, optional
+        Maximum number of closure evaluations for L-BFGS. Defaults to 5.
 
     Returns
     -------
@@ -397,12 +409,12 @@ def create_optimizer_beam_tilt(
     if optimizer_type == "lbfgs":
         return torch.optim.LBFGS(
             [odd_zernikes["Z31c"], odd_zernikes["Z31s"]],
-            lr=1.0,
+            lr=lr,
             line_search_fn="strong_wolfe",
-            max_eval=5,  # Limit closure calls to prevent excessive recomputation
+            max_eval=max_eval,
         )
     elif optimizer_type == "adam":
-        return torch.optim.Adam([odd_zernikes["Z31c"], odd_zernikes["Z31s"]], lr=1.0)
+        return torch.optim.Adam([odd_zernikes["Z31c"], odd_zernikes["Z31s"]], lr=lr)
     else:
         raise ValueError(f"Unknown optimizer type: {optimizer_type}")
 
@@ -417,6 +429,9 @@ def setup_refinement_parameters(
     initial_astigmatism_angle: torch.Tensor | None = None,
     initial_astigmatism_magnitude: torch.Tensor | None = None,
     optimizer_type: str = "adam",
+    anisotropic_mag_lr: float = 0.005,
+    beam_tilt_lr: float = 1.0,
+    lbfgs_max_eval: int = 5,
 ) -> dict[str, Any]:
     """Set up refinement parameters and optimizers.
 
@@ -440,6 +455,12 @@ def setup_refinement_parameters(
         The initial astigmatism magnitude.
     optimizer_type : str, optional
         Type of optimizer to use ("adam" or "lbfgs"). Defaults to "adam".
+    anisotropic_mag_lr : float, optional
+        Learning rate for anisotropic magnification optimizer. Defaults to 0.005.
+    beam_tilt_lr : float, optional
+        Learning rate for beam tilt optimizer. Defaults to 1.0.
+    lbfgs_max_eval : int, optional
+        Maximum number of closure evaluations for L-BFGS optimizers. Defaults to 5.
 
     Returns
     -------
@@ -454,7 +475,12 @@ def setup_refinement_parameters(
             anistropic_mag = initial_mag_matrix.to(device).requires_grad_(True)
         else:
             anistropic_mag = torch.eye(2, 2, device=device, requires_grad=True)
-        optimizer_aniso = create_optimizer_aniso(anistropic_mag, optimizer_type)
+        optimizer_aniso = create_optimizer_aniso(
+            anistropic_mag,
+            optimizer_type,
+            lr=anisotropic_mag_lr,
+            max_eval=lbfgs_max_eval,
+        )
     else:
         if initial_mag_matrix is not None:
             anistropic_mag = initial_mag_matrix.to(device)
@@ -472,7 +498,9 @@ def setup_refinement_parameters(
                 "Z31c": torch.tensor(0.0, device=device, requires_grad=True),
                 "Z31s": torch.tensor(0.0, device=device, requires_grad=True),
             }
-        optimizer_beam_tilt = create_optimizer_beam_tilt(odd_zernikes, optimizer_type)
+        optimizer_beam_tilt = create_optimizer_beam_tilt(
+            odd_zernikes, optimizer_type, lr=beam_tilt_lr, max_eval=lbfgs_max_eval
+        )
     else:
         if initial_odd_zernikes is not None:
             odd_zernikes = {
@@ -645,6 +673,7 @@ def update_gpu_setup_states(
 def check_convergence(
     loss_history: list[float],
     convergence_threshold: float,
+    num_convergence_iterations: int = 5,
 ) -> tuple[bool, list[float]]:
     """Check if loss has converged based on threshold.
 
@@ -654,17 +683,22 @@ def check_convergence(
         History of loss values.
     convergence_threshold : float
         Threshold for convergence.
+    num_convergence_iterations : int, optional
+        Number of consecutive iterations to check for convergence. Defaults to 5.
 
     Returns
     -------
     tuple[bool, list[float]]
         Tuple containing:
         - converged: bool indicating if convergence was detected
-        - updated_loss_history: list with at most last 6 values
+        - updated_loss_history: list with at most last
+          (num_convergence_iterations + 1) values
     """
-    if len(loss_history) >= 6:
+    min_history_len = num_convergence_iterations + 1
+    if len(loss_history) >= min_history_len:
         converged = True
-        for j in range(len(loss_history) - 5, len(loss_history) - 1):
+        start_idx = len(loss_history) - num_convergence_iterations
+        for j in range(start_idx, len(loss_history) - 1):
             abs_change = abs(loss_history[j + 1] - loss_history[j])
             if abs_change > convergence_threshold:
                 converged = False
@@ -675,12 +709,15 @@ def check_convergence(
             print(
                 f"Converged: absolute change in dataset loss "
                 f"({last_change:.6f}) <= threshold "
-                f"({convergence_threshold:.6f}) for 5 consecutive "
+                f"({convergence_threshold:.6f}) for "
+                f"{num_convergence_iterations} consecutive "
                 f"iterations. Stopping early."
             )
-            return True, loss_history[-6:]
+            return True, loss_history[-min_history_len:]
 
-        return False, loss_history[-6:]
+        return False, loss_history[
+            -min_history_len:
+        ]  # Keep only last (num_convergence_iterations + 1) values
     return False, loss_history
 
 

@@ -46,6 +46,12 @@ def core_refine_ctf(
     initial_astigmatism_angle: torch.Tensor | None = None,
     initial_astigmatism_magnitude: torch.Tensor | None = None,
     convergence_threshold: float = 0.0005,
+    num_convergence_iterations: int = 5,
+    lbfgs_max_eval: int = 5,
+    anisotropic_mag_lr: float = 0.005,
+    beam_tilt_lr: float = 1.0,
+    astigmatism_angle_lr: float = 1.0,
+    astigmatism_magnitude_lr: float = 5.0,
 ) -> dict[str, Any]:
     """
     Refine the CTF parameters for the micrographs.
@@ -87,7 +93,19 @@ def core_refine_ctf(
         The initial astigmatism magnitude.
     convergence_threshold: float = 0.0005,
         Convergence threshold. If loss doesn't improve by more than this
-        amount for 5 iterations, stop early.
+        amount for num_convergence_iterations iterations, stop early.
+    num_convergence_iterations: int = 5,
+        Number of consecutive iterations to check for convergence.
+    lbfgs_max_eval: int = 5,
+        Maximum number of closure evaluations for L-BFGS optimizers.
+    anisotropic_mag_lr: float = 0.005,
+        Learning rate for anisotropic magnification optimizer.
+    beam_tilt_lr: float = 1.0,
+        Learning rate for beam tilt optimizer.
+    astigmatism_angle_lr: float = 1.0,
+        Learning rate for astigmatism angle optimizer.
+    astigmatism_magnitude_lr: float = 5.0,
+        Learning rate for astigmatism magnitude optimizer.
 
     Returns
     -------
@@ -114,6 +132,9 @@ def core_refine_ctf(
         initial_astigmatism_angle=initial_astigmatism_angle,
         initial_astigmatism_magnitude=initial_astigmatism_magnitude,
         optimizer_type="lbfgs",
+        anisotropic_mag_lr=anisotropic_mag_lr,
+        beam_tilt_lr=beam_tilt_lr,
+        lbfgs_max_eval=lbfgs_max_eval,
     )
 
     # Run the dataset loop with multiple devices
@@ -131,6 +152,9 @@ def core_refine_ctf(
         apply_global_filtering=apply_global_filtering,
         preprocessing_filters=preprocessing_filters,
         convergence_threshold=convergence_threshold,
+        num_convergence_iterations=num_convergence_iterations,
+        astigmatism_angle_lr=astigmatism_angle_lr,
+        astigmatism_magnitude_lr=astigmatism_magnitude_lr,
         initial_astigmatism_angle=initial_astigmatism_angle,
         initial_astigmatism_magnitude=initial_astigmatism_magnitude,
         setup_state=setup_state,
@@ -152,6 +176,9 @@ def _dataset_loop(
     apply_global_filtering: bool,
     preprocessing_filters: PreprocessingFilters,
     convergence_threshold: float,
+    num_convergence_iterations: int,
+    astigmatism_angle_lr: float,
+    astigmatism_magnitude_lr: float,
     initial_astigmatism_angle: torch.Tensor | None,
     initial_astigmatism_magnitude: torch.Tensor | None,
     setup_state: dict[str, Any],
@@ -186,6 +213,12 @@ def _dataset_loop(
         Filters to apply to the particle images.
     convergence_threshold : float
         Convergence threshold for early stopping.
+    num_convergence_iterations : int
+        Number of consecutive iterations to check for convergence.
+    astigmatism_angle_lr : float
+        Learning rate for astigmatism angle optimizer.
+    astigmatism_magnitude_lr : float
+        Learning rate for astigmatism magnitude optimizer.
     initial_astigmatism_angle : torch.Tensor | None
         Initial astigmatism angle tensor.
     initial_astigmatism_magnitude : torch.Tensor | None
@@ -280,6 +313,9 @@ def _dataset_loop(
                         apply_global_filtering=apply_global_filtering,
                         preprocessing_filters=preprocessing_filters,
                         convergence_threshold=convergence_threshold,
+                        num_convergence_iterations=num_convergence_iterations,
+                        astigmatism_angle_lr=astigmatism_angle_lr,
+                        astigmatism_magnitude_lr=astigmatism_magnitude_lr,
                         num_results_files=num_micrographs,
                         initial_astigmatism_angle=initial_astigmatism_angle,
                         initial_astigmatism_magnitude=initial_astigmatism_magnitude,
@@ -391,6 +427,9 @@ def _dataset_loop(
                     apply_global_filtering=apply_global_filtering,
                     preprocessing_filters=preprocessing_filters,
                     convergence_threshold=convergence_threshold,
+                    num_convergence_iterations=num_convergence_iterations,
+                    astigmatism_angle_lr=astigmatism_angle_lr,
+                    astigmatism_magnitude_lr=astigmatism_magnitude_lr,
                     num_results_files=num_micrographs,
                     initial_astigmatism_angle=initial_astigmatism_angle,
                     initial_astigmatism_magnitude=initial_astigmatism_magnitude,
@@ -492,6 +531,9 @@ def _dataset_loop(
                         apply_global_filtering=apply_global_filtering,
                         preprocessing_filters=preprocessing_filters,
                         convergence_threshold=convergence_threshold,
+                        num_convergence_iterations=num_convergence_iterations,
+                        astigmatism_angle_lr=astigmatism_angle_lr,
+                        astigmatism_magnitude_lr=astigmatism_magnitude_lr,
                         num_results_files=num_micrographs,
                         initial_astigmatism_angle=astigmatism_angle_all,
                         initial_astigmatism_magnitude=astigmatism_magnitude_all,
@@ -588,6 +630,9 @@ def _dataset_loop(
                         apply_global_filtering=apply_global_filtering,
                         preprocessing_filters=preprocessing_filters,
                         convergence_threshold=convergence_threshold,
+                        num_convergence_iterations=num_convergence_iterations,
+                        astigmatism_angle_lr=astigmatism_angle_lr,
+                        astigmatism_magnitude_lr=astigmatism_magnitude_lr,
                         num_results_files=num_micrographs,
                         initial_astigmatism_angle=astigmatism_angle_all,
                         initial_astigmatism_magnitude=astigmatism_magnitude_all,
@@ -656,7 +701,9 @@ def _dataset_loop(
 
         # Check convergence
         loss_history.append(avg_dataset_loss)
-        converged, loss_history = check_convergence(loss_history, convergence_threshold)
+        converged, loss_history = check_convergence(
+            loss_history, convergence_threshold, num_convergence_iterations
+        )
         if converged:
             break
 
@@ -688,6 +735,9 @@ def _micrograph_loop(
     apply_global_filtering: bool,
     preprocessing_filters: PreprocessingFilters,
     convergence_threshold: float,
+    num_convergence_iterations: int,
+    astigmatism_angle_lr: float,
+    astigmatism_magnitude_lr: float,
     num_results_files: int,
     initial_astigmatism_angle: torch.Tensor | None,
     initial_astigmatism_magnitude: torch.Tensor | None,
@@ -725,6 +775,12 @@ def _micrograph_loop(
         Filters to apply to the particle images.
     convergence_threshold : float
         Convergence threshold for early stopping.
+    num_convergence_iterations : int
+        Number of consecutive iterations to check for convergence.
+    astigmatism_angle_lr : float
+        Learning rate for astigmatism angle optimizer.
+    astigmatism_magnitude_lr : float
+        Learning rate for astigmatism magnitude optimizer.
     num_results_files : int
         Total number of micrographs.
     initial_astigmatism_angle : torch.Tensor | None
@@ -777,8 +833,8 @@ def _micrograph_loop(
 
         optimizer_astig = torch.optim.LBFGS(
             [
-                {"params": [astigmatism_angle], "lr": 1.0},
-                {"params": [astigmatism_magnitude], "lr": 5.0},
+                {"params": [astigmatism_angle], "lr": astigmatism_angle_lr},
+                {"params": [astigmatism_magnitude], "lr": astigmatism_magnitude_lr},
             ],
             line_search_fn="strong_wolfe",
         )
@@ -826,12 +882,14 @@ def _micrograph_loop(
         # Check for convergence based on micrograph loss (end of inner loop)
         if refine_astigmatism and outer_iteration == 0:
             micrograph_loss_history.append(loss_val)
-            if len(micrograph_loss_history) >= 6:
+            min_history_len = num_convergence_iterations + 1
+            if len(micrograph_loss_history) >= min_history_len:
                 # Check if absolute change has been less than threshold
-                # for the last 5 consecutive iterations
+                # for the last num_convergence_iterations consecutive iterations
                 converged = True
                 hist_len = len(micrograph_loss_history)
-                for j in range(hist_len - 5, hist_len - 1):
+                start_idx = hist_len - num_convergence_iterations
+                for j in range(start_idx, hist_len - 1):
                     abs_change = abs(
                         micrograph_loss_history[j + 1] - micrograph_loss_history[j]
                     )
@@ -846,12 +904,13 @@ def _micrograph_loop(
                     print(
                         f"  Micrograph {i + 1} converged: absolute change "
                         f"in micrograph loss ({last_change:.6f}) <= "
-                        f"threshold ({convergence_threshold:.6f}) for 5 "
+                        f"threshold ({convergence_threshold:.6f}) for "
+                        f"{num_convergence_iterations} "
                         f"consecutive iterations. Stopping inner loop early."
                     )
                     break
-                # Keep only last 6 values for efficiency
-                micrograph_loss_history = micrograph_loss_history[-6:]
+                # Keep only last (num_convergence_iterations + 1) values for efficiency
+                micrograph_loss_history = micrograph_loss_history[-min_history_len:]
 
         # Optimize astigmatism parameters (per micrograph, inner loop)
         # Only optimize on iteration 0

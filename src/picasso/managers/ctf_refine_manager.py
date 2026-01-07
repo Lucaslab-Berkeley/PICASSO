@@ -89,6 +89,16 @@ class CTFRefineManager(BaseModelPICASSO):
             ),
             "per_dataset_iterations": (self.ctf_refine_config.per_dataset_iterations),
             "convergence_threshold": self.ctf_refine_config.convergence_threshold,
+            "num_convergence_iterations": (
+                self.ctf_refine_config.num_convergence_iterations
+            ),
+            "lbfgs_max_eval": self.ctf_refine_config.lbfgs_max_eval,
+            "anisotropic_mag_lr": self.ctf_refine_config.anisotropic_mag_lr,
+            "beam_tilt_lr": self.ctf_refine_config.beam_tilt_lr,
+            "astigmatism_angle_lr": self.ctf_refine_config.astigmatism_angle_lr,
+            "astigmatism_magnitude_lr": (
+                self.ctf_refine_config.astigmatism_magnitude_lr
+            ),
         }
 
         return backend_kwargs
