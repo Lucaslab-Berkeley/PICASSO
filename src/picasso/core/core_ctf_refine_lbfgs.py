@@ -831,11 +831,20 @@ def _micrograph_loop(
             initial_astigmatism_magnitude=initial_astigmatism_magnitude,
         )
 
+        # Scale magnitude parameter so both parameters are on same scale for LBFGS
+        # LBFGS doesn't support per-parameter options, so we scale the magnitude
+        # by dividing by the learning rate ratio, then use the lower learning rate
+        # This makes the scaled parameter's gradient larger, compensating for the
+        # lower learning rate
+        lr_ratio = astigmatism_magnitude_lr / astigmatism_angle_lr
+        # Create a leaf tensor for optimization by detaching and cloning
+        astigmatism_magnitude_scaled = (
+            (astigmatism_magnitude / lr_ratio).detach().clone().requires_grad_(True)
+        )
+
         optimizer_astig = torch.optim.LBFGS(
-            [
-                {"params": [astigmatism_angle], "lr": astigmatism_angle_lr},
-                {"params": [astigmatism_magnitude], "lr": astigmatism_magnitude_lr},
-            ],
+            [astigmatism_angle, astigmatism_magnitude_scaled],
+            lr=astigmatism_angle_lr,
             line_search_fn="strong_wolfe",
         )
     else:
@@ -844,6 +853,8 @@ def _micrograph_loop(
             device=device,
         )
         initial_defocus_mean = None
+        lr_ratio = 1.0  # Not used when not refining, but needed for consistency
+        astigmatism_magnitude_scaled = astigmatism_magnitude  # For consistency
 
     # Only run inner loop (per-micrograph optimizer) on iteration 0
     # On later iterations, just compute loss once for dataset optimizers
@@ -853,10 +864,12 @@ def _micrograph_loop(
     for inner_iter in range(inner_iterations):
         # Update defocus_u and defocus_v from astigmatism parameters if optimizing
         if refine_astigmatism:
+            # Unscale magnitude to get original value for calculations
+            astigmatism_magnitude_unscaled = astigmatism_magnitude_scaled * lr_ratio
             # Broadcast astigmatism_magnitude (scalar) to match initial_defocus_mean
             # shape
-            defocus_u = initial_defocus_mean + astigmatism_magnitude / 2.0
-            defocus_v = initial_defocus_mean - astigmatism_magnitude / 2.0
+            defocus_u = initial_defocus_mean + astigmatism_magnitude_unscaled / 2.0
+            defocus_v = initial_defocus_mean - astigmatism_magnitude_unscaled / 2.0
             # Broadcast astigmatism_angle to match defocus_u/defocus_v shape
             # (one value per particle)
             num_particles = defocus_u.shape[0]
@@ -923,8 +936,16 @@ def _micrograph_loop(
                 optimizer_astig.zero_grad()
                 # Recompute forward pass and loss
                 if refine_astigmatism:
-                    defocus_u = initial_defocus_mean + astigmatism_magnitude / 2.0
-                    defocus_v = initial_defocus_mean - astigmatism_magnitude / 2.0
+                    # Unscale magnitude to get original value for calculations
+                    astigmatism_magnitude_unscaled = (
+                        astigmatism_magnitude_scaled * lr_ratio
+                    )
+                    defocus_u = (
+                        initial_defocus_mean + astigmatism_magnitude_unscaled / 2.0
+                    )
+                    defocus_v = (
+                        initial_defocus_mean - astigmatism_magnitude_unscaled / 2.0
+                    )
                     num_particles = defocus_u.shape[0]
                     astigmatism_angle_broadcast = astigmatism_angle.expand(
                         num_particles
@@ -955,10 +976,12 @@ def _micrograph_loop(
                 angle_val = astigmatism_angle.item()
             else:
                 angle_val = float(astigmatism_angle)
-            if hasattr(astigmatism_magnitude, "item"):
-                mag_val = astigmatism_magnitude.item()
+            # Unscale magnitude for display
+            astigmatism_magnitude_unscaled = astigmatism_magnitude_scaled * lr_ratio
+            if hasattr(astigmatism_magnitude_unscaled, "item"):
+                mag_val = astigmatism_magnitude_unscaled.item()
             else:
-                mag_val = float(astigmatism_magnitude)
+                mag_val = float(astigmatism_magnitude_unscaled)
             print(
                 f"    Micrograph {i + 1} astigmatism: "
                 f"angle={angle_val:.2f}°, "
@@ -969,7 +992,10 @@ def _micrograph_loop(
     astigmatism_result = {}
     if refine_astigmatism:
         astigmatism_result["angle"] = astigmatism_angle.detach()
-        astigmatism_result["magnitude"] = astigmatism_magnitude.detach()
+        # Unscale magnitude before returning
+        astigmatism_result["magnitude"] = (
+            astigmatism_magnitude_scaled * lr_ratio
+        ).detach()
     else:
         astigmatism_result["angle"] = astigmatism_angle
         astigmatism_result["magnitude"] = astigmatism_magnitude
