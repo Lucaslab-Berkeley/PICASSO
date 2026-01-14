@@ -18,8 +18,13 @@ class ComputationalConfig(BaseModel):
         Field which specifies which GPU(s) or CPU to use for computation.
         The following types of values are allowed:
         - A single integer, e.g. 0, which means to use GPU with ID 0.
+        - A numeric string, e.g. "3", which will be converted to "cuda:3".
         - A device specifier string, e.g. "cuda:0", which means to use GPU with ID 0.
-        - A list of integers or strings, e.g. [0, 1] or ["cuda:0", "cuda:1"].
+        - A list of integers, e.g. [0, 1] or in YAML format:
+          gpu_ids:
+            - 0
+            - 1
+        - A list of strings, e.g. ["cuda:0", "cuda:1"] or ["0", "1"].
         - The specific string "cpu" which means to use CPU.
         - The specific string "all" which means to use all available CUDA devices.
     """
@@ -61,35 +66,49 @@ class ComputationalConfig(BaseModel):
         if isinstance(v, list):
             if len(v) == 0:
                 raise ValueError("gpu_ids list cannot be empty.")
+            normalized_list = []
             for item in v:
                 if not isinstance(item, (int, str)):
                     raise ValueError(
                         f"Invalid type in gpu_ids list: {type(item)}. "
                         "Expected int or str."
                     )
-                if (
-                    isinstance(item, str)
-                    and item != "cpu"
-                    and not item.startswith("cuda:")
-                ):
-                    raise ValueError(
-                        f"Invalid string value in gpu_ids: {item}. "
-                        "Expected 'cpu' or a cuda device specifier like 'cuda:0'."
-                    )
-            return v
+                # Convert numeric strings to cuda:X format
+                if isinstance(item, str):
+                    if item == "cpu":
+                        normalized_list.append(item)
+                    elif item.isdigit():
+                        # Convert numeric string like "3" to "cuda:3"
+                        normalized_list.append(f"cuda:{item}")
+                    elif item.startswith("cuda:"):
+                        normalized_list.append(item)
+                    else:
+                        raise ValueError(
+                            f"Invalid string value in gpu_ids: {item}. "
+                            "Expected 'cpu' or a cuda device specifier like 'cuda:0'."
+                        )
+                else:
+                    normalized_list.append(item)
+            return normalized_list
 
         # Handle single int
         if isinstance(v, int):
             return v
 
-        # Handle single string (must be 'cpu' or 'cuda:X')
+        # Handle single string (must be 'cpu', 'all', 'cuda:X', or a numeric string)
         if isinstance(v, str):
-            if v != "cpu" and not v.startswith("cuda:"):
+            if v == "cpu" or v == "all":
+                return v
+            elif v.isdigit():
+                # Convert numeric string like "3" to "cuda:3"
+                return f"cuda:{v}"
+            elif v.startswith("cuda:"):
+                return v
+            else:
                 raise ValueError(
                     f"Invalid string value for gpu_ids: {v}. "
                     "Expected 'cpu', 'all', or a cuda device specifier like 'cuda:0'."
                 )
-            return v
 
         # If we get here, the type is invalid
         raise ValueError(
