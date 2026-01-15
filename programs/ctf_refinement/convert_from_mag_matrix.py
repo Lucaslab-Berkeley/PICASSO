@@ -57,7 +57,7 @@ def convert_from_mag_matrix(
     max_idx = 1 - min_idx
 
     lambda_min = eigenvalues[min_idx]  # Smaller eigenvalue -> major axis
-    lambda_max = eigenvalues[max_idx]   # Larger eigenvalue -> minor axis
+    lambda_max = eigenvalues[max_idx]  # Larger eigenvalue -> minor axis
 
     # The smaller eigenvalue is the scale factor for the major axis
     scale_major = lambda_min
@@ -76,7 +76,7 @@ def convert_from_mag_matrix(
         eigenvector_major = eigenvector_major / norm
 
     angle = math.atan2(eigenvector_major[1], eigenvector_major[0])
-    
+
     # Normalize angle to [0, pi) range since axis orientation is modulo 180 degrees
     # (an axis pointing in opposite direction is the same axis)
     if angle < 0:
@@ -238,4 +238,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

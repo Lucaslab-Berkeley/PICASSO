@@ -1,6 +1,5 @@
 """Program for running CTF refinement using 2D template matching."""
 
-import pickle
 import time
 from pathlib import Path
 
@@ -42,16 +41,18 @@ def main() -> None:
     elapsed_time_str = time.strftime("%H:%M:%S", time.gmtime(elapsed_time))
     print(f"CTF Refinement wall time: {elapsed_time_str}")
 
-    # Exporting the refined CTF parameters to a pickle file
+    # Exporting the refined CTF parameters
     print("Exporting results...")
 
     if OUTPUT_PATH is not None:
-        # Use the specified output path
-        output_path = Path(OUTPUT_PATH)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_path, "wb") as f:
-            pickle.dump(refined_ctf_params, f)
+        # Extract filename from OUTPUT_PATH if provided
+        output_filename = Path(OUTPUT_PATH).name
+        ctf_manager.write_refined_ctf_params(
+            refined_ctf_params, filename=output_filename
+        )
+        output_path = Path(ctf_manager.output_config.output_directory) / output_filename
         print(f"Refined CTF parameters saved to: {output_path}")
+        print(f"Text summary saved to: {output_path.with_suffix('.txt')}")
     else:
         # Use the manager's write method with config output_directory
         ctf_manager.write_refined_ctf_params(refined_ctf_params)
@@ -61,9 +62,21 @@ def main() -> None:
                 / "refined_ctf_params.pkl"
             )
             print(f"Refined CTF parameters saved to: {output_path}")
+            print(f"Text summary saved to: {output_path.with_suffix('.txt')}")
         else:
             print("Warning: No output directory specified. Results not saved to disk.")
             print("Refined CTF parameters are available in the returned dictionary.")
+
+    # Update results CSV files with refined parameters
+    if ctf_manager.output_config.output_directory is not None:
+        print("Updating results CSV files...")
+        try:
+            ctf_manager.updated_results_csvs(refined_ctf_params)
+            print("Results CSV files updated successfully.")
+        except ValueError as e:
+            print(f"Warning: Could not update CSV files: {e}")
+    else:
+        print("Warning: No output directory specified. CSV files not updated.")
 
     print("Done!")
 

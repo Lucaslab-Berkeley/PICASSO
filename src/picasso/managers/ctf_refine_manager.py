@@ -5,6 +5,7 @@ import warnings
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
 import torch
 from leopard_em.pydantic_models.config import PreprocessingFilters
 
@@ -238,3 +239,150 @@ class CTFRefineManager(BaseModelPICASSO):
             )
 
         return refined_ctf_params
+
+    def updated_results_csvs(
+        self,
+        refined_ctf_params: dict[str, Any],
+    ) -> None:
+        """Update results CSV files with refined CTF parameters.
+
+        This function creates new CSV files with updated mag_matrix, odd_zernikes,
+        and defocus_u/defocus_v columns based on refined values from
+        refined_ctf_params. Original files are not modified.
+
+        Parameters
+        ----------
+        refined_ctf_params : dict[str, Any]
+            Dictionary containing the refined CTF parameters from refine_ctf().
+
+        Raises
+        ------
+        ValueError
+            If output_directory is None.
+
+        Notes
+        -----
+        - New files are written to output_directory with `_ctf-refine.csv` suffix
+          (e.g., `results.csv` -> `results_ctf-refine.csv`)
+        - mag_matrix is converted from [[1,2],[3,4]] format to [1,2,3,4] format
+        - odd_zernikes is converted from dict to list format [val1, val2, ...]
+        - For astigmatism, defocus_u and defocus_v are updated while keeping
+          the mean the same (mean = (defocus_u + defocus_v) / 2)
+        - Columns are created if they don't exist
+        """
+        if self.output_config.output_directory is None:
+            raise ValueError("output_directory must be set to write results.")
+
+        # Get results files
+        results_files = get_results_files(
+            results_directory=self.input_config.results_directory,
+            results_pattern=self.input_config.results_pattern,
+        )
+
+        # Create output directory if it doesn't exist
+        output_dir = Path(self.output_config.output_directory)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Process each results file
+        for micrograph_idx, results_file in enumerate(results_files):
+            # Read CSV file
+            df = pd.read_csv(results_file)
+
+            # Update mag_matrix
+            if "anistropic_mag" in refined_ctf_params:
+                mag_matrix = refined_ctf_params["anistropic_mag"]
+                # Convert 2x2 matrix to flat list [a, b, c, d]
+                if isinstance(mag_matrix, torch.Tensor):
+                    mag_np = mag_matrix.cpu().numpy()
+                else:
+                    mag_np = mag_matrix
+                # Flatten: [[a, b], [c, d]] -> [a, b, c, d]
+                mag_flat = mag_np.flatten().tolist()
+                mag_str = f"[{', '.join(map(str, mag_flat))}]"
+
+                # Create column if it doesn't exist
+                if "mag_matrix" not in df.columns:
+                    df["mag_matrix"] = ""
+
+                # Update all rows with the same mag_matrix value
+                df["mag_matrix"] = mag_str
+
+            # Update odd_zernikes
+            if "odd_zernikes" in refined_ctf_params:
+                odd_zernikes = refined_ctf_params["odd_zernikes"]
+                # Convert dict to list format
+                zernike_values = []
+                for key in sorted(odd_zernikes.keys()):
+                    val = odd_zernikes[key]
+                    if isinstance(val, torch.Tensor):
+                        zernike_values.append(val.cpu().item())
+                    else:
+                        zernike_values.append(float(val))
+                zernike_str = f"[{', '.join(map(str, zernike_values))}]"
+
+                # Create column if it doesn't exist
+                if "odd_zernikes" not in df.columns:
+                    df["odd_zernikes"] = ""
+
+                # Update all rows with the same odd_zernikes value
+                df["odd_zernikes"] = zernike_str
+
+            # Update defocus_u and defocus_v from astigmatism
+            if (
+                "astigmatism_angle" in refined_ctf_params
+                and "astigmatism_magnitude" in refined_ctf_params
+            ):
+                astigmatism_angle = refined_ctf_params["astigmatism_angle"]
+                astigmatism_magnitude = refined_ctf_params["astigmatism_magnitude"]
+
+                # Get astigmatism values for this micrograph
+                if isinstance(astigmatism_angle, torch.Tensor):
+                    if astigmatism_angle.numel() > 1:
+                        astig_angle = astigmatism_angle[micrograph_idx].cpu().item()
+                    else:
+                        astig_angle = astigmatism_angle.cpu().item()
+                else:
+                    astig_angle = float(astigmatism_angle)
+
+                if isinstance(astigmatism_magnitude, torch.Tensor):
+                    if astigmatism_magnitude.numel() > 1:
+                        astig_mag = astigmatism_magnitude[micrograph_idx].cpu().item()
+                    else:
+                        astig_mag = astigmatism_magnitude.cpu().item()
+                else:
+                    astig_mag = float(astigmatism_magnitude)
+
+                # Create columns if they don't exist
+                if "defocus_u" not in df.columns:
+                    df["defocus_u"] = 0.0
+                if "defocus_v" not in df.columns:
+                    df["defocus_v"] = 0.0
+
+                # Calculate mean defocus from existing values (keep mean same)
+                if len(df) > 0:
+                    defocus_u_vals = pd.to_numeric(
+                        df["defocus_u"], errors="coerce"
+                    ).fillna(0.0)
+                    defocus_v_vals = pd.to_numeric(
+                        df["defocus_v"], errors="coerce"
+                    ).fillna(0.0)
+                    defocus_mean = (defocus_u_vals + defocus_v_vals) / 2.0
+
+                    # Update defocus_u and defocus_v based on astigmatism
+                    # defocus_u = mean + magnitude / 2
+                    # defocus_v = mean - magnitude / 2
+                    df["defocus_u"] = defocus_mean + astig_mag / 2.0
+                    df["defocus_v"] = defocus_mean - astig_mag / 2.0
+
+                # Update astigmatism_angle column
+                if "astigmatism_angle" not in df.columns:
+                    df["astigmatism_angle"] = ""
+                df["astigmatism_angle"] = astig_angle
+
+            # Create new filename: replace .csv with _ctf-refine.csv
+            results_path = Path(results_file)
+            new_filename = results_path.stem + "_ctf-refine.csv"
+            output_path = output_dir / new_filename
+
+            # Write updated CSV to new file
+            df.to_csv(output_path, index=False)
