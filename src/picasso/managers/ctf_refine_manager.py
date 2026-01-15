@@ -1,5 +1,6 @@
 """Manager for refining CTF parameters for 2D in situ data."""
 
+import json
 import os
 import warnings
 from pathlib import Path
@@ -310,15 +311,15 @@ class CTFRefineManager(BaseModelPICASSO):
             # Update odd_zernikes
             if "odd_zernikes" in refined_ctf_params:
                 odd_zernikes = refined_ctf_params["odd_zernikes"]
-                # Convert dict to list format
-                zernike_values = []
-                for key in sorted(odd_zernikes.keys()):
-                    val = odd_zernikes[key]
+                # Convert dict to string format like {"Z31c": 0.0, "Z31s": 0.0}
+                zernike_dict = {}
+                for key, val in odd_zernikes.items():
                     if isinstance(val, torch.Tensor):
-                        zernike_values.append(val.cpu().item())
+                        zernike_dict[key] = val.cpu().item()
                     else:
-                        zernike_values.append(float(val))
-                zernike_str = f"[{', '.join(map(str, zernike_values))}]"
+                        zernike_dict[key] = float(val)
+                # Format as JSON string with double quotes
+                zernike_str = json.dumps(zernike_dict)
 
                 # Create column if it doesn't exist
                 if "odd_zernikes" not in df.columns:
