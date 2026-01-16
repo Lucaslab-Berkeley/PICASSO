@@ -580,10 +580,10 @@ def _dataset_loop(
 
         if refine_beam_tilt and optimizer_beam_tilt is not None:
             # Clear gradients that were accumulated in the loop (closure will recompute)
-            if odd_zernikes["Z31c"].grad is not None:
-                odd_zernikes["Z31c"].grad = None
-            if odd_zernikes["Z31s"].grad is not None:
-                odd_zernikes["Z31s"].grad = None
+            if odd_zernikes["log_Z31c"].grad is not None:
+                odd_zernikes["log_Z31c"].grad = None
+            if odd_zernikes["log_Z31s"].grad is not None:
+                odd_zernikes["log_Z31s"].grad = None
 
             # Track closure calls for debugging
             closure_call_count = [0]  # Use list to allow modification in closure
@@ -684,11 +684,13 @@ def _dataset_loop(
                 refine_beam_tilt=refine_beam_tilt,
             )
 
-        # Print statistics
-        z31c = odd_zernikes["Z31c"]
-        z31c_val = z31c.item() if hasattr(z31c, "item") else float(z31c)
-        z31s = odd_zernikes["Z31s"]
-        z31s_val = z31s.item() if hasattr(z31s, "item") else float(z31s)
+        # Print statistics (convert from log space to actual values)
+        log_z31c = odd_zernikes["log_Z31c"]
+        log_z31s = odd_zernikes["log_Z31s"]
+        z31c_exp = torch.exp(log_z31c)
+        z31s_exp = torch.exp(log_z31s)
+        z31c_val = z31c_exp.item() if hasattr(log_z31c, "item") else float(z31c_exp)
+        z31s_val = z31s_exp.item() if hasattr(log_z31s, "item") else float(z31s_exp)
         print(f"Zernike coefficients: Z31c={z31c_val:.6f}, Z31s={z31s_val:.6f}")
 
         avg_dataset_loss = dataset_loss_value / num_micrographs
