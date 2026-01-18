@@ -6,6 +6,7 @@ import warnings
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import torch
 from leopard_em.pydantic_models.config import PreprocessingFilters
@@ -83,6 +84,7 @@ class CTFRefineManager(BaseModelPICASSO):
             "refine_anisotropic_mag": self.ctf_refine_config.refine_anisotropic_mag,
             "refine_astigmatism": self.ctf_refine_config.refine_astigmatism,
             "refine_beam_tilt": self.ctf_refine_config.refine_beam_tilt,
+            "refine_defocus": self.ctf_refine_config.refine_defocus,
             "apply_global_filtering": self.ctf_refine_config.apply_global_filtering,
             "preprocessing_filters": self.preprocessing_filters,
             "batch_size": self.input_config.batch_size,
@@ -101,6 +103,7 @@ class CTFRefineManager(BaseModelPICASSO):
             "astigmatism_magnitude_lr": (
                 self.ctf_refine_config.astigmatism_magnitude_lr
             ),
+            "defocus_lr": self.ctf_refine_config.defocus_lr,
         }
 
         return backend_kwargs
@@ -227,6 +230,7 @@ class CTFRefineManager(BaseModelPICASSO):
             initial_odd_zernikes=final_initial_odd_zernikes,
             initial_astigmatism_angle=final_initial_astigmatism_angle,
             initial_astigmatism_magnitude=final_initial_astigmatism_magnitude,
+            output_directory=self.output_config.output_directory,
         )
 
         # Write loss CSV files if requested
@@ -379,6 +383,39 @@ class CTFRefineManager(BaseModelPICASSO):
                 if "astigmatism_angle" not in df.columns:
                     df["astigmatism_angle"] = ""
                 df["astigmatism_angle"] = astig_angle
+
+            # Update defocus values (refined_relative_defocus or relative_defocus)
+            # Add the refined defocus_tensor to the existing column values
+            if "defocus_all" in refined_ctf_params:
+                defocus_all = refined_ctf_params["defocus_all"]
+                if micrograph_idx in defocus_all:
+                    defocus_tensor = defocus_all[micrograph_idx]
+                    if isinstance(defocus_tensor, torch.Tensor):
+                        defocus_values = defocus_tensor.cpu().numpy()
+                    else:
+                        defocus_values = np.array(defocus_tensor)
+
+                    # Try to add to refined_relative_defocus first,
+                    # then relative_defocus
+                    if "refined_relative_defocus" in df.columns:
+                        # Add refined defocus to existing values
+                        existing_values = pd.to_numeric(
+                            df["refined_relative_defocus"], errors="coerce"
+                        ).fillna(0.0)
+                        df["refined_relative_defocus"] = (
+                            existing_values.values + defocus_values
+                        )
+                    elif "relative_defocus" in df.columns:
+                        # Add refined defocus to existing values
+                        existing_values = pd.to_numeric(
+                            df["relative_defocus"], errors="coerce"
+                        ).fillna(0.0)
+                        df["relative_defocus"] = (
+                            existing_values.values + defocus_values
+                        )
+                    else:
+                        # Create refined_relative_defocus column if neither exists
+                        df["refined_relative_defocus"] = defocus_values
 
             # Create new filename: replace .csv with _ctf-refine.csv
             results_path = Path(results_file)

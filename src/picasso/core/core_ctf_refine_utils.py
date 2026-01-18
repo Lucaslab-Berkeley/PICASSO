@@ -4,6 +4,7 @@ import math
 from typing import Any, cast
 
 import numpy as np
+import pandas as pd
 import torch
 from leopard_em.backend.core_differentiable_refine import core_differentiable_refine
 from leopard_em.pydantic_models.config import PreprocessingFilters
@@ -200,6 +201,47 @@ def get_non_refined_astigmatism_values(
     return astigmatism_angle, astigmatism_magnitude
 
 
+def initialize_defocus_parameters(
+    results_path: str,
+    particle_backend_kwargs: dict[str, Any],
+    device: torch.device,
+) -> torch.Tensor:
+    """Initialize defocus parameters for a micrograph.
+
+    Parameters
+    ----------
+    results_path : str
+        Path to results CSV file.
+    particle_backend_kwargs : dict[str, Any]
+        Particle backend kwargs containing defocus information.
+        Used to determine the number of particles.
+    device : torch.device
+        Device to use for tensors.
+
+    Returns
+    -------
+    torch.Tensor
+        Per-particle defocus tensor initialized to zeros with requires_grad=True.
+        Note: The defocus values from CSV are already included in defocus_u/defocus_v
+        from particle_backend_kwargs, so we initialize to zero and add our refinement.
+    """
+    # Get number of particles from defocus_u in particle_backend_kwargs
+    defocus_u = particle_backend_kwargs["defocus_u"]
+    if isinstance(defocus_u, torch.Tensor):
+        num_particles = defocus_u.shape[0]
+    else:
+        # If it's a scalar or list, we need to check the CSV
+        df = pd.read_csv(results_path)
+        num_particles = len(df)
+
+    # Initialize to zeros - the CSV defocus values are already in defocus_u/defocus_v
+    defocus_tensor = torch.zeros(
+        num_particles, dtype=torch.float32, device=device, requires_grad=True
+    )
+
+    return defocus_tensor
+
+
 def setup_particle_backend_for_micrograph(
     results_path: str,
     template: torch.Tensor,
@@ -272,10 +314,12 @@ def setup_particle_backend_for_micrograph(
     if anistropic_mag is not None:
         particle_backend_kwargs["transform_matrix"] = anistropic_mag
     if odd_zernikes is not None:
-        # Convert from log space to actual values using exp()
+        # Convert from asinh space to actual values using sinh()
+        # Scale factor matches the one used in setup_refinement_parameters
+        zernike_scale = 1e6
         particle_backend_kwargs["ctf_kwargs"]["odd_zernikes"] = {
-            "Z31c": torch.exp(odd_zernikes["log_Z31c"]),
-            "Z31s": torch.exp(odd_zernikes["log_Z31s"]),
+            "Z31c": zernike_scale * torch.sinh(odd_zernikes["asinh_Z31c"]),
+            "Z31s": zernike_scale * torch.sinh(odd_zernikes["asinh_Z31s"]),
         }
 
     return cast("dict[str, Any]", particle_backend_kwargs)
@@ -392,12 +436,12 @@ def create_optimizer_beam_tilt(
     lr: float = 1.0,
     max_eval: int = 5,
 ) -> torch.optim.Optimizer | None:
-    """Create optimizer for beam tilt (odd Zernike coefficients in log space).
+    """Create optimizer for beam tilt (odd Zernike coefficients in asinh space).
 
     Parameters
     ----------
     odd_zernikes : dict[str, torch.Tensor]
-        Dictionary with "log_Z31c" and "log_Z31s" keys containing log-space parameters.
+        Dictionary with "asinh_Z31c" and "asinh_Z31s" keys containing asinh-space parameters.
     optimizer_type : str, optional
         Type of optimizer to create. Either "adam" or "lbfgs". Defaults to "adam".
     lr : float, optional
@@ -412,14 +456,14 @@ def create_optimizer_beam_tilt(
     """
     if optimizer_type == "lbfgs":
         return torch.optim.LBFGS(
-            [odd_zernikes["log_Z31c"], odd_zernikes["log_Z31s"]],
+            [odd_zernikes["asinh_Z31c"], odd_zernikes["asinh_Z31s"]],
             lr=lr,
             line_search_fn="strong_wolfe",
             max_eval=max_eval,
         )
     elif optimizer_type == "adam":
         return torch.optim.Adam(
-            [odd_zernikes["log_Z31c"], odd_zernikes["log_Z31s"]], lr=lr
+            [odd_zernikes["asinh_Z31c"], odd_zernikes["asinh_Z31s"]], lr=lr
         )
     else:
         raise ValueError(f"Unknown optimizer type: {optimizer_type}")
@@ -494,43 +538,48 @@ def setup_refinement_parameters(
             anistropic_mag = torch.eye(2, 2, device=device)
 
     if refine_beam_tilt:
+        # Scale factor for asinh transformation (values expected in range ~[-1e6, 1e6])
+        zernike_scale = 1e6
         if initial_odd_zernikes is not None:
-            # Convert initial values to log space
-            # Use torch.clamp to avoid log(0) or log(negative)
+            # Convert initial values to asinh space
             z31c_init = initial_odd_zernikes["Z31c"].to(device)
             z31s_init = initial_odd_zernikes["Z31s"].to(device)
-            # Clamp to positive values before taking log
-            z31c_init = torch.clamp(z31c_init, min=1e-10)
-            z31s_init = torch.clamp(z31s_init, min=1e-10)
+            # Transform: asinh(value / scale)
+            # asinh handles both positive and negative values smoothly
+            asinh_z31c = torch.asinh(z31c_init / zernike_scale)
+            asinh_z31s = torch.asinh(z31s_init / zernike_scale)
+            
             odd_zernikes = {
-                "log_Z31c": torch.log(z31c_init).requires_grad_(True),
-                "log_Z31s": torch.log(z31s_init).requires_grad_(True),
+                "asinh_Z31c": asinh_z31c.requires_grad_(True),
+                "asinh_Z31s": asinh_z31s.requires_grad_(True),
             }
         else:
-            # Initialize to log(1.0) = 0.0, which corresponds to exp(0) = 1.0
-            # This is a reasonable starting point that will scale up during optimization
+            # Initialize to 0.0 in asinh space, which corresponds to actual value 0.0
+            # (since asinh(0) = 0, and scale * sinh(0) = 0)
             odd_zernikes = {
-                "log_Z31c": torch.tensor(0.0, device=device, requires_grad=True),
-                "log_Z31s": torch.tensor(0.0, device=device, requires_grad=True),
+                "asinh_Z31c": torch.tensor(0.0, device=device, requires_grad=True),
+                "asinh_Z31s": torch.tensor(0.0, device=device, requires_grad=True),
             }
         optimizer_beam_tilt = create_optimizer_beam_tilt(
             odd_zernikes, optimizer_type, lr=beam_tilt_lr, max_eval=lbfgs_max_eval
         )
     else:
+        # Scale factor for asinh transformation
+        zernike_scale = 1e6
         if initial_odd_zernikes is not None:
-            # For non-refined case, still convert to log space for consistency
+            # For non-refined case, convert to asinh space for consistency
             z31c_init = initial_odd_zernikes["Z31c"].to(device)
             z31s_init = initial_odd_zernikes["Z31s"].to(device)
-            z31c_init = torch.clamp(z31c_init, min=1e-10)
-            z31s_init = torch.clamp(z31s_init, min=1e-10)
+            asinh_z31c = torch.asinh(z31c_init / zernike_scale)
+            asinh_z31s = torch.asinh(z31s_init / zernike_scale)
             odd_zernikes = {
-                "log_Z31c": torch.log(z31c_init),
-                "log_Z31s": torch.log(z31s_init),
+                "asinh_Z31c": asinh_z31c,
+                "asinh_Z31s": asinh_z31s,
             }
         else:
             odd_zernikes = {
-                "log_Z31c": torch.tensor(0.0, device=device),
-                "log_Z31s": torch.tensor(0.0, device=device),
+                "asinh_Z31c": torch.tensor(0.0, device=device),
+                "asinh_Z31s": torch.tensor(0.0, device=device),
             }
 
     if initial_astigmatism_angle is not None:
@@ -630,20 +679,20 @@ def create_gpu_setup_states(
         else:
             aniso_mag_gpu = anistropic_mag.to(device)
         if refine_beam_tilt:
-            log_z31c_gpu = (
-                odd_zernikes["log_Z31c"].to(device).detach().requires_grad_(True)
+            asinh_z31c_gpu = (
+                odd_zernikes["asinh_Z31c"].to(device).detach().requires_grad_(True)
             )
-            log_z31s_gpu = (
-                odd_zernikes["log_Z31s"].to(device).detach().requires_grad_(True)
+            asinh_z31s_gpu = (
+                odd_zernikes["asinh_Z31s"].to(device).detach().requires_grad_(True)
             )
         else:
-            log_z31c_gpu = odd_zernikes["log_Z31c"].to(device)
-            log_z31s_gpu = odd_zernikes["log_Z31s"].to(device)
+            asinh_z31c_gpu = odd_zernikes["asinh_Z31c"].to(device)
+            asinh_z31s_gpu = odd_zernikes["asinh_Z31s"].to(device)
         state_copy = {
             "anistropic_mag": aniso_mag_gpu,
             "odd_zernikes": {
-                "log_Z31c": log_z31c_gpu,
-                "log_Z31s": log_z31s_gpu,
+                "asinh_Z31c": asinh_z31c_gpu,
+                "asinh_Z31s": asinh_z31s_gpu,
             },
             "pixel_size_offsets": setup_state["pixel_size_offsets"].to(device),
             "euler_angle_offsets": setup_state["euler_angle_offsets"].to(device),
@@ -686,11 +735,11 @@ def update_gpu_setup_states(
                 anistropic_mag.data.to(device)
             )
         if refine_beam_tilt:
-            setup_states[gpu_id]["odd_zernikes"]["log_Z31c"].data.copy_(
-                odd_zernikes["log_Z31c"].data.to(device)
+            setup_states[gpu_id]["odd_zernikes"]["asinh_Z31c"].data.copy_(
+                odd_zernikes["asinh_Z31c"].data.to(device)
             )
-            setup_states[gpu_id]["odd_zernikes"]["log_Z31s"].data.copy_(
-                odd_zernikes["log_Z31s"].data.to(device)
+            setup_states[gpu_id]["odd_zernikes"]["asinh_Z31s"].data.copy_(
+                odd_zernikes["asinh_Z31s"].data.to(device)
             )
 
 
@@ -751,6 +800,7 @@ def create_final_results_dict(
     astigmatism_magnitude_all: torch.Tensor,
     dataset_losses: list[tuple[int, float]],
     micrograph_losses: dict[int, list[tuple[int, float]]],
+    defocus_all: dict[int, torch.Tensor] | None = None,
 ) -> dict[str, Any]:
     """Create final results dictionary.
 
@@ -766,25 +816,32 @@ def create_final_results_dict(
         Dataset-level loss history.
     micrograph_losses : dict[int, list[tuple[int, float]]]
         Micrograph-level loss history.
+    defocus_all : dict[int, torch.Tensor] | None, optional
+        Per-micrograph defocus tensors. If None, defocus was not refined.
 
     Returns
     -------
     dict[str, Any]
         Final results dictionary.
     """
-    # Convert from log space to actual values for final results
-    odd_zernikes_log = setup_state["odd_zernikes"]
-    return {
+    # Convert from asinh space to actual values for final results
+    odd_zernikes_asinh = setup_state["odd_zernikes"]
+    zernike_scale = 1e6
+    result = {
         "anistropic_mag": setup_state["anistropic_mag"].detach(),
         "odd_zernikes": {
-            "Z31c": torch.exp(odd_zernikes_log["log_Z31c"]).detach(),
-            "Z31s": torch.exp(odd_zernikes_log["log_Z31s"]).detach(),
+            "Z31c": (zernike_scale * torch.sinh(odd_zernikes_asinh["asinh_Z31c"])).detach(),
+            "Z31s": (zernike_scale * torch.sinh(odd_zernikes_asinh["asinh_Z31s"])).detach(),
         },
         "astigmatism_angle": astigmatism_angle_all.detach(),
         "astigmatism_magnitude": astigmatism_magnitude_all.detach(),
         "dataset_losses": dataset_losses,
         "micrograph_losses": micrograph_losses,
     }
+    # Only include defocus_all if it was refined (not None)
+    if defocus_all is not None:
+        result["defocus_all"] = {k: v.detach() for k, v in defocus_all.items()}
+    return result
 
 
 def accumulate_gradients_from_gpu_worker(
@@ -819,16 +876,16 @@ def accumulate_gradients_from_gpu_worker(
             anistropic_mag.grad.add_(grads["anistropic_mag"].to(primary_device))
 
     if refine_beam_tilt:
-        if "log_Z31c" in grads:
-            if odd_zernikes["log_Z31c"].grad is None:
-                odd_zernikes["log_Z31c"].grad = grads["log_Z31c"].to(primary_device)
+        if "asinh_Z31c" in grads:
+            if odd_zernikes["asinh_Z31c"].grad is None:
+                odd_zernikes["asinh_Z31c"].grad = grads["asinh_Z31c"].to(primary_device)
             else:
-                odd_zernikes["log_Z31c"].grad.add_(grads["log_Z31c"].to(primary_device))
-        if "log_Z31s" in grads:
-            if odd_zernikes["log_Z31s"].grad is None:
-                odd_zernikes["log_Z31s"].grad = grads["log_Z31s"].to(primary_device)
+                odd_zernikes["asinh_Z31c"].grad.add_(grads["asinh_Z31c"].to(primary_device))
+        if "asinh_Z31s" in grads:
+            if odd_zernikes["asinh_Z31s"].grad is None:
+                odd_zernikes["asinh_Z31s"].grad = grads["asinh_Z31s"].to(primary_device)
             else:
-                odd_zernikes["log_Z31s"].grad.add_(grads["log_Z31s"].to(primary_device))
+                odd_zernikes["asinh_Z31s"].grad.add_(grads["asinh_Z31s"].to(primary_device))
 
 
 def collect_gradients_from_micrograph_loss(
@@ -871,12 +928,12 @@ def collect_gradients_from_micrograph_loss(
                 if local_setup["anistropic_mag"].grad is not None:
                     local_setup["anistropic_mag"].grad.zero_()
             if refine_beam_tilt:
-                log_z31c = local_setup["odd_zernikes"]["log_Z31c"]
-                if log_z31c.requires_grad and log_z31c.grad is not None:
-                    log_z31c.grad.zero_()
-                log_z31s = local_setup["odd_zernikes"]["log_Z31s"]
-                if log_z31s.requires_grad and log_z31s.grad is not None:
-                    log_z31s.grad.zero_()
+                asinh_z31c = local_setup["odd_zernikes"]["asinh_Z31c"]
+                if asinh_z31c.requires_grad and asinh_z31c.grad is not None:
+                    asinh_z31c.grad.zero_()
+                asinh_z31s = local_setup["odd_zernikes"]["asinh_Z31s"]
+                if asinh_z31s.requires_grad and asinh_z31s.grad is not None:
+                    asinh_z31s.grad.zero_()
 
             # Compute gradients
             scaled_loss.backward(retain_graph=False)
@@ -889,13 +946,13 @@ def collect_gradients_from_micrograph_loss(
                     local_setup["anistropic_mag"].grad = None
 
             if refine_beam_tilt:
-                log_z31c = local_setup["odd_zernikes"]["log_Z31c"]
-                if log_z31c.requires_grad and log_z31c.grad is not None:
-                    grads["log_Z31c"] = log_z31c.grad.detach().clone().cpu()
-                    log_z31c.grad = None
-                log_z31s = local_setup["odd_zernikes"]["log_Z31s"]
-                if log_z31s.requires_grad and log_z31s.grad is not None:
-                    grads["log_Z31s"] = log_z31s.grad.detach().clone().cpu()
-                    log_z31s.grad = None
+                asinh_z31c = local_setup["odd_zernikes"]["asinh_Z31c"]
+                if asinh_z31c.requires_grad and asinh_z31c.grad is not None:
+                    grads["asinh_Z31c"] = asinh_z31c.grad.detach().clone().cpu()
+                    asinh_z31c.grad = None
+                asinh_z31s = local_setup["odd_zernikes"]["asinh_Z31s"]
+                if asinh_z31s.requires_grad and asinh_z31s.grad is not None:
+                    grads["asinh_Z31s"] = asinh_z31s.grad.detach().clone().cpu()
+                    asinh_z31s.grad = None
 
     return grads

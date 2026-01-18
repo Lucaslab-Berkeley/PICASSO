@@ -12,17 +12,19 @@ class CtfRefineConfig(BaseModelPICASSO):
     refine_anisotropic_mag: bool = False
     refine_astigmatism: bool = False
     refine_beam_tilt: bool = False
+    refine_defocus: bool = False
     apply_global_filtering: bool = True
     per_micrograph_iterations: int = 10
     per_dataset_iterations: int = 10
-    convergence_threshold: float = 0.0005
+    convergence_threshold: float = 0.0001
     num_convergence_iterations: int = 5
     optimizer: str = "lbfgs"
     lbfgs_max_eval: int = 5
     anisotropic_mag_lr: float = 0.005
-    beam_tilt_lr: float = 1.0
-    astigmatism_angle_lr: float = 1.0
+    beam_tilt_lr: float = 0.01
+    astigmatism_angle_lr: float = 5.0
     astigmatism_magnitude_lr: float = 5.0
+    defocus_lr: float = 5.0
 
     @model_validator(mode="after")  # type: ignore
     def validate_optimizer(self) -> Self:

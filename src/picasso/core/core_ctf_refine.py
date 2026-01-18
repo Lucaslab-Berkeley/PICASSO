@@ -1,6 +1,7 @@
 """Core functions for CTF refinement with multi-GPU support."""
 # pylint: disable=too-many-lines
 
+from pathlib import Path
 from queue import Queue
 from threading import Thread
 from typing import Any
@@ -20,11 +21,28 @@ from picasso.core.core_ctf_refine_utils import (
     get_loss_scalar_tensor,
     get_non_refined_astigmatism_values,
     initialize_astigmatism_parameters,
+    initialize_defocus_parameters,
     output_mag_matrix,
     setup_particle_backend_for_micrograph,
     setup_refinement_parameters,
     update_gpu_setup_states,
 )
+
+
+def _log_message(message: str, log_file: Any = None) -> None:
+    """Write message to both console and log file if provided.
+
+    Parameters
+    ----------
+    message : str
+        Message to log.
+    log_file : Any, optional
+        File handle to write to. If None, only prints to console.
+    """
+    print(message)
+    if log_file is not None:
+        log_file.write(message + "\n")
+        log_file.flush()  # Ensure it's written immediately
 
 
 # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
@@ -36,6 +54,7 @@ def core_refine_ctf(
     refine_anisotropic_mag: bool,
     refine_astigmatism: bool,
     refine_beam_tilt: bool,
+    refine_defocus: bool,
     apply_global_filtering: bool,
     preprocessing_filters: PreprocessingFilters,
     batch_size: int,
@@ -52,6 +71,8 @@ def core_refine_ctf(
     beam_tilt_lr: float = 1.0,
     astigmatism_angle_lr: float = 1.0,
     astigmatism_magnitude_lr: float = 5.0,
+    defocus_lr: float = 1.0,
+    output_directory: str | Path | None = None,
 ) -> dict[str, Any]:
     """
     Refine the CTF parameters for the micrographs.
@@ -107,6 +128,10 @@ def core_refine_ctf(
         Learning rate for astigmatism angle optimizer.
     astigmatism_magnitude_lr: float = 5.0,
         Learning rate for astigmatism magnitude optimizer.
+    defocus_lr: float = 1.0,
+        Learning rate for defocus optimizer.
+    output_directory: str | Path | None, optional
+        Directory where log file will be written. If None, no log file is created.
 
     Returns
     -------
@@ -138,28 +163,49 @@ def core_refine_ctf(
         lbfgs_max_eval=lbfgs_max_eval,  # Not used for Adam, but required
     )
 
-    # Run the dataset loop with multiple devices
-    return _dataset_loop(
-        results_files=results_files,
-        template=template,
-        template_box_size=template_box_size,
-        device_list=device_list,
-        batch_size=batch_size,
-        per_micrograph_iterations=per_micrograph_iterations,
-        per_dataset_iterations=per_dataset_iterations,
-        refine_anisotropic_mag=refine_anisotropic_mag,
-        refine_astigmatism=refine_astigmatism,
-        refine_beam_tilt=refine_beam_tilt,
-        apply_global_filtering=apply_global_filtering,
-        preprocessing_filters=preprocessing_filters,
-        convergence_threshold=convergence_threshold,
-        num_convergence_iterations=num_convergence_iterations,
-        astigmatism_angle_lr=astigmatism_angle_lr,
-        astigmatism_magnitude_lr=astigmatism_magnitude_lr,
-        initial_astigmatism_angle=initial_astigmatism_angle,
-        initial_astigmatism_magnitude=initial_astigmatism_magnitude,
-        setup_state=setup_state,
-    )
+    # Setup log file if output directory is provided
+    log_file = None
+    log_file_path = None
+    if output_directory is not None:
+        output_dir = Path(output_directory)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        log_file_path = output_dir / "ctf_refinement.log"
+        log_file = open(log_file_path, "w", encoding="utf-8")
+        log_file.write("CTF Refinement Log\n")
+        log_file.write("=" * 50 + "\n\n")
+        log_file.flush()
+
+    try:
+        # Run the dataset loop with multiple devices
+        return _dataset_loop(
+            results_files=results_files,
+            template=template,
+            template_box_size=template_box_size,
+            device_list=device_list,
+            batch_size=batch_size,
+            per_micrograph_iterations=per_micrograph_iterations,
+            per_dataset_iterations=per_dataset_iterations,
+            refine_anisotropic_mag=refine_anisotropic_mag,
+            refine_astigmatism=refine_astigmatism,
+            refine_beam_tilt=refine_beam_tilt,
+            refine_defocus=refine_defocus,
+            apply_global_filtering=apply_global_filtering,
+            preprocessing_filters=preprocessing_filters,
+            convergence_threshold=convergence_threshold,
+            num_convergence_iterations=num_convergence_iterations,
+            astigmatism_angle_lr=astigmatism_angle_lr,
+            astigmatism_magnitude_lr=astigmatism_magnitude_lr,
+            defocus_lr=defocus_lr,
+            initial_astigmatism_angle=initial_astigmatism_angle,
+            initial_astigmatism_magnitude=initial_astigmatism_magnitude,
+            setup_state=setup_state,
+            log_file=log_file,
+        )
+    finally:
+        if log_file is not None:
+            log_file.close()
+            if log_file_path is not None:
+                print(f"CTF refinement log saved to: {log_file_path}")
 
 
 # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-branches,too-many-statements
@@ -174,15 +220,18 @@ def _dataset_loop(
     refine_anisotropic_mag: bool,
     refine_astigmatism: bool,
     refine_beam_tilt: bool,
+    refine_defocus: bool,
     apply_global_filtering: bool,
     preprocessing_filters: PreprocessingFilters,
     convergence_threshold: float,
     num_convergence_iterations: int,
     astigmatism_angle_lr: float,
     astigmatism_magnitude_lr: float,
+    defocus_lr: float,
     initial_astigmatism_angle: torch.Tensor | None,
     initial_astigmatism_magnitude: torch.Tensor | None,
     setup_state: dict[str, Any],
+    log_file: Any = None,
 ) -> dict[str, Any]:
     """Run the outer dataset loop for dataset-level optimization.
 
@@ -220,12 +269,17 @@ def _dataset_loop(
         Learning rate for astigmatism angle optimizer.
     astigmatism_magnitude_lr : float
         Learning rate for astigmatism magnitude optimizer.
+    defocus_lr : float
+        Learning rate for defocus optimizer.
     initial_astigmatism_angle : torch.Tensor | None
         Initial astigmatism angle tensor.
     initial_astigmatism_magnitude : torch.Tensor | None
         Initial astigmatism magnitude tensor.
     setup_state : dict[str, Any]
         Setup state from _setup_refinement.
+    log_file : Any, optional
+        File handle for logging. If provided, debug messages will be written
+        to this file in addition to console output.
 
     Returns
     -------
@@ -242,6 +296,9 @@ def _dataset_loop(
     optimizer_aniso = setup_state["optimizer_aniso"]
     optimizer_beam_tilt = setup_state["optimizer_beam_tilt"]
 
+    # Store defocus results per micrograph
+    defocus_all: dict[int, torch.Tensor] = {}
+
     loss_history: list[float] = []
     dataset_losses: list[tuple[int, float]] = []
     micrograph_losses: dict[int, list[tuple[int, float]]] = {}
@@ -250,9 +307,12 @@ def _dataset_loop(
     # Distribute micrographs across GPUs
     gpu_assignments = distribute_micrographs_across_gpus(num_micrographs, num_gpus)
 
-    print(f"\nUsing {num_gpus} GPUs:")
+    _log_message(f"\nUsing {num_gpus} GPUs:", log_file)
     for gpu_id, indices in enumerate(gpu_assignments):
-        print(f"  GPU {gpu_id} ({device_list[gpu_id]}): {len(indices)} micrographs")
+        _log_message(
+            f"  GPU {gpu_id} ({device_list[gpu_id]}): {len(indices)} micrographs",
+            log_file,
+        )
 
     # Create replicas of template on each GPU
     templates = [template.to(device) for device in device_list]
@@ -304,7 +364,7 @@ def _dataset_loop(
 
                     results_path = results_files[i]
 
-                    micrograph_loss, astigmatism_result = _micrograph_loop(
+                    micrograph_loss, astigmatism_result, defocus_result = _micrograph_loop(
                         i=i,
                         results_path=results_path,
                         template=local_template,
@@ -316,12 +376,14 @@ def _dataset_loop(
                         refine_anisotropic_mag=refine_anisotropic_mag,
                         refine_astigmatism=refine_astigmatism,
                         refine_beam_tilt=refine_beam_tilt,
+                        refine_defocus=refine_defocus,
                         apply_global_filtering=apply_global_filtering,
                         preprocessing_filters=preprocessing_filters,
                         convergence_threshold=convergence_threshold,
                         num_convergence_iterations=num_convergence_iterations,
                         astigmatism_angle_lr=astigmatism_angle_lr,
                         astigmatism_magnitude_lr=astigmatism_magnitude_lr,
+                        defocus_lr=defocus_lr,
                         num_results_files=num_micrographs,
                         initial_astigmatism_angle=initial_astigmatism_angle,
                         initial_astigmatism_magnitude=initial_astigmatism_magnitude,
@@ -335,9 +397,10 @@ def _dataset_loop(
                     else:
                         loss_val = float(micrograph_loss)
 
-                    print(
+                    _log_message(
                         f"  GPU {gpu_id}: Micrograph {i + 1}/{num_micrographs} "
-                        f"loss: {loss_val:.6f}"
+                        f"loss: {loss_val:.6f}",
+                        log_file,
                     )
 
                     # Collect gradients from GPU-local parameters for
@@ -359,6 +422,7 @@ def _dataset_loop(
                             "loss": loss_val,
                             "astigmatism_angle": astigmatism_result["angle"],
                             "astigmatism_magnitude": astigmatism_result["magnitude"],
+                            "defocus": defocus_result,
                             "grads": grads,
                         }
                     )
@@ -398,6 +462,8 @@ def _dataset_loop(
                 astigmatism_magnitude_all[i] = result["astigmatism_magnitude"].to(
                     primary_device
                 )
+                if refine_defocus and result.get("defocus") is not None:
+                    defocus_all[i] = result["defocus"].to(primary_device)
 
                 if i not in micrograph_losses:
                     micrograph_losses[i] = []
@@ -418,7 +484,7 @@ def _dataset_loop(
         else:
             # Single GPU path
             for i, results_path in enumerate(results_files):
-                micrograph_loss, astigmatism_result = _micrograph_loop(
+                micrograph_loss, astigmatism_result, defocus_result = _micrograph_loop(
                     i=i,
                     results_path=results_path,
                     template=template,
@@ -430,12 +496,14 @@ def _dataset_loop(
                     refine_anisotropic_mag=refine_anisotropic_mag,
                     refine_astigmatism=refine_astigmatism,
                     refine_beam_tilt=refine_beam_tilt,
+                    refine_defocus=refine_defocus,
                     apply_global_filtering=apply_global_filtering,
                     preprocessing_filters=preprocessing_filters,
                     convergence_threshold=convergence_threshold,
                     num_convergence_iterations=num_convergence_iterations,
                     astigmatism_angle_lr=astigmatism_angle_lr,
                     astigmatism_magnitude_lr=astigmatism_magnitude_lr,
+                    defocus_lr=defocus_lr,
                     num_results_files=num_micrographs,
                     initial_astigmatism_angle=initial_astigmatism_angle,
                     initial_astigmatism_magnitude=initial_astigmatism_magnitude,
@@ -444,6 +512,8 @@ def _dataset_loop(
 
                 astigmatism_angle_all[i] = astigmatism_result["angle"]
                 astigmatism_magnitude_all[i] = astigmatism_result["magnitude"]
+                if refine_defocus and defocus_result is not None:
+                    defocus_all[i] = defocus_result
 
                 if i not in micrograph_losses:
                     micrograph_losses[i] = []
@@ -465,7 +535,10 @@ def _dataset_loop(
                     scaled_loss = micrograph_loss_scalar / num_micrographs
                     scaled_loss.backward()
 
-                print(f"  Micrograph {i + 1}/{num_micrographs} loss: {loss_val:.6f}")
+                _log_message(
+                    f"  Micrograph {i + 1}/{num_micrographs} loss: {loss_val:.6f}",
+                    log_file,
+                )
 
                 if primary_device.type == "cuda":
                     torch.cuda.empty_cache()
@@ -474,10 +547,46 @@ def _dataset_loop(
         if refine_anisotropic_mag and optimizer_aniso is not None:
             optimizer_aniso.step()
             # Print mag matrix after each update
-            print("\nMagnification matrix after update:")
-            print(anistropic_mag.detach().cpu().numpy())
+            _log_message("\nMagnification matrix after update:", log_file)
+            _log_message(
+                str(anistropic_mag.detach().cpu().numpy()), log_file
+            )
         if refine_beam_tilt and optimizer_beam_tilt is not None:
+            # Store values before optimization for comparison
+            zernike_scale = 1e6
+            asinh_z31c_before = odd_zernikes["asinh_Z31c"].item()
+            asinh_z31s_before = odd_zernikes["asinh_Z31s"].item()
+            z31c_before = (
+                zernike_scale * torch.sinh(odd_zernikes["asinh_Z31c"])
+            ).item()
+            z31s_before = (
+                zernike_scale * torch.sinh(odd_zernikes["asinh_Z31s"])
+            ).item()
+
             optimizer_beam_tilt.step()
+
+            # Log values after optimization
+            asinh_z31c_after = odd_zernikes["asinh_Z31c"].item()
+            asinh_z31s_after = odd_zernikes["asinh_Z31s"].item()
+            z31c_after = (
+                zernike_scale * torch.sinh(odd_zernikes["asinh_Z31c"])
+            ).item()
+            z31s_after = (
+                zernike_scale * torch.sinh(odd_zernikes["asinh_Z31s"])
+            ).item()
+
+            _log_message(
+                f"  Beam tilt optimization (asinh-space): "
+                f"asinh_Z31c: {asinh_z31c_before:.6f} -> {asinh_z31c_after:.6f}, "
+                f"asinh_Z31s: {asinh_z31s_before:.6f} -> {asinh_z31s_after:.6f}",
+                log_file,
+            )
+            _log_message(
+                f"  Beam tilt optimization (actual): "
+                f"Z31c: {z31c_before:.6f} -> {z31c_after:.6f}, "
+                f"Z31s: {z31s_before:.6f} -> {z31s_after:.6f}",
+                log_file,
+            )
 
         # Update GPU-local copies with new master parameter values
         if num_gpus > 1:
@@ -489,19 +598,40 @@ def _dataset_loop(
                 refine_beam_tilt=refine_beam_tilt,
             )
 
-        # Print statistics (convert from log space to actual values)
-        log_z31c = odd_zernikes["log_Z31c"]
-        log_z31s = odd_zernikes["log_Z31s"]
-        z31c_exp = torch.exp(log_z31c)
-        z31s_exp = torch.exp(log_z31s)
-        z31c_val = z31c_exp.item() if hasattr(log_z31c, "item") else float(z31c_exp)
-        z31s_val = z31s_exp.item() if hasattr(log_z31s, "item") else float(z31s_exp)
-        print(f"Zernike coefficients: Z31c={z31c_val:.6f}, Z31s={z31s_val:.6f}")
+        # Print statistics (show both asinh-space and actual values)
+        zernike_scale = 1e6
+        asinh_z31c = odd_zernikes["asinh_Z31c"]
+        asinh_z31s = odd_zernikes["asinh_Z31s"]
+        asinh_z31c_val = (
+            asinh_z31c.item() if hasattr(asinh_z31c, "item") else float(asinh_z31c)
+        )
+        asinh_z31s_val = (
+            asinh_z31s.item() if hasattr(asinh_z31s, "item") else float(asinh_z31s)
+        )
+        z31c_actual = zernike_scale * torch.sinh(asinh_z31c)
+        z31s_actual = zernike_scale * torch.sinh(asinh_z31s)
+        z31c_val = (
+            z31c_actual.item() if hasattr(z31c_actual, "item") else float(z31c_actual)
+        )
+        z31s_val = (
+            z31s_actual.item() if hasattr(z31s_actual, "item") else float(z31s_actual)
+        )
+        _log_message(
+            f"Zernike coefficients (asinh-space): "
+            f"asinh_Z31c={asinh_z31c_val:.6f}, "
+            f"asinh_Z31s={asinh_z31s_val:.6f}",
+            log_file,
+        )
+        _log_message(
+            f"Zernike coefficients (actual): Z31c={z31c_val:.6f}, Z31s={z31s_val:.6f}",
+            log_file,
+        )
 
         avg_dataset_loss = dataset_loss_value / num_micrographs
-        print(
+        _log_message(
             f"Dataset iteration {outer_iteration + 1}/"
-            f"{per_dataset_iterations} loss: {avg_dataset_loss:.6f}\n"
+            f"{per_dataset_iterations} loss: {avg_dataset_loss:.6f}\n",
+            log_file,
         )
 
         dataset_losses.append((outer_iteration, avg_dataset_loss))
@@ -523,6 +653,7 @@ def _dataset_loop(
         astigmatism_magnitude_all=astigmatism_magnitude_all,
         dataset_losses=dataset_losses,
         micrograph_losses=micrograph_losses,
+        defocus_all=defocus_all if refine_defocus else None,
     )
 
 
@@ -542,17 +673,19 @@ def _micrograph_loop(
     refine_anisotropic_mag: bool,
     refine_astigmatism: bool,
     refine_beam_tilt: bool,
+    refine_defocus: bool,
     apply_global_filtering: bool,
     preprocessing_filters: PreprocessingFilters,
     convergence_threshold: float,
     num_convergence_iterations: int,
     astigmatism_angle_lr: float,
     astigmatism_magnitude_lr: float,
+    defocus_lr: float,
     num_results_files: int,
     initial_astigmatism_angle: torch.Tensor | None,
     initial_astigmatism_magnitude: torch.Tensor | None,
     setup_state: dict[str, Any],
-) -> tuple[torch.Tensor, dict[str, Any]]:
+) -> tuple[torch.Tensor, dict[str, Any], torch.Tensor | None]:
     """Process a single micrograph through inner iterations.
 
     Parameters
@@ -579,6 +712,8 @@ def _micrograph_loop(
         Whether to refine the astigmatism.
     refine_beam_tilt : bool
         Whether to refine the beam tilt.
+    refine_defocus : bool
+        Whether to refine per-particle defocus.
     apply_global_filtering : bool
         Whether to apply global filtering to the micrographs.
     preprocessing_filters : PreprocessingFilters
@@ -591,6 +726,8 @@ def _micrograph_loop(
         Learning rate for astigmatism angle optimizer.
     astigmatism_magnitude_lr : float
         Learning rate for astigmatism magnitude optimizer.
+    defocus_lr : float
+        Learning rate for defocus optimizer.
     num_results_files : int
         Total number of micrographs.
     initial_astigmatism_angle : torch.Tensor | None
@@ -602,8 +739,8 @@ def _micrograph_loop(
 
     Returns
     -------
-    tuple[torch.Tensor, dict[str, Any]]
-        Micrograph loss and updated astigmatism values.
+    tuple[torch.Tensor, dict[str, Any], torch.Tensor | None]
+        Micrograph loss, updated astigmatism values, and defocus tensor (if refined).
     """
     anistropic_mag = setup_state["anistropic_mag"]
     odd_zernikes = setup_state["odd_zernikes"]
@@ -654,6 +791,32 @@ def _micrograph_loop(
         )
         initial_defocus_mean = None
 
+    # Initialize defocus parameters for this micrograph
+    optimizer_defocus = None
+    defocus_tensor = None
+    initial_defocus_u = None
+    initial_defocus_v = None
+    if refine_defocus:
+        defocus_tensor = initialize_defocus_parameters(
+            results_path=results_path,
+            particle_backend_kwargs=particle_backend_kwargs,
+            device=device,
+        )
+        # Get initial defocus_u and defocus_v to add defocus_tensor to them
+        initial_defocus_u = particle_backend_kwargs["defocus_u"]
+        initial_defocus_v = particle_backend_kwargs["defocus_v"]
+        # Convert to tensors if needed
+        if not isinstance(initial_defocus_u, torch.Tensor):
+            initial_defocus_u = torch.tensor(initial_defocus_u, device=device)
+        else:
+            initial_defocus_u = initial_defocus_u.to(device)
+        if not isinstance(initial_defocus_v, torch.Tensor):
+            initial_defocus_v = torch.tensor(initial_defocus_v, device=device)
+        else:
+            initial_defocus_v = initial_defocus_v.to(device)
+        
+        optimizer_defocus = torch.optim.Adam([defocus_tensor], lr=defocus_lr)
+
     # Only run inner loop (per-micrograph optimizer) on iteration 0
     # On later iterations, just compute loss once for dataset optimizers
     inner_iterations = per_micrograph_iterations if outer_iteration == 0 else 1
@@ -675,6 +838,12 @@ def _micrograph_loop(
             particle_backend_kwargs["defocus_v"] = defocus_v
             particle_backend_kwargs["defocus_angle"] = astigmatism_angle_broadcast
 
+        # Update defocus_u and defocus_v from defocus parameters if optimizing
+        if refine_defocus and defocus_tensor is not None:
+            # Add defocus_tensor to initial defocus values
+            particle_backend_kwargs["defocus_u"] = initial_defocus_u + defocus_tensor
+            particle_backend_kwargs["defocus_v"] = initial_defocus_v + defocus_tensor
+
         micrograph_loss = compute_micrograph_loss(
             particle_backend_kwargs=particle_backend_kwargs,
             batch_size=batch_size,
@@ -689,7 +858,7 @@ def _micrograph_loop(
         )
 
         # Check for convergence based on micrograph loss (end of inner loop)
-        if refine_astigmatism and outer_iteration == 0:
+        if (refine_astigmatism or refine_defocus) and outer_iteration == 0:
             micrograph_loss_history.append(loss_val)
             min_history_len = num_convergence_iterations + 1
             if len(micrograph_loss_history) >= min_history_len:
@@ -746,6 +915,26 @@ def _micrograph_loop(
                 f"magnitude={mag_val:.2f} Å"
             )
 
+        # Optimize defocus parameters (per micrograph, inner loop)
+        # Only optimize on iteration 0
+        if refine_defocus and outer_iteration == 0 and optimizer_defocus is not None:
+            # Ensure micrograph_loss is a scalar for backward()
+            micrograph_loss_scalar = get_loss_scalar_tensor(micrograph_loss)
+            optimizer_defocus.zero_grad()
+            # Retain graph if we need gradients for dataset-level optimizers
+            retain_graph = refine_anisotropic_mag or refine_beam_tilt
+            micrograph_loss_scalar.backward(retain_graph=retain_graph)
+            optimizer_defocus.step()
+            # Print defocus statistics after optimization
+            if defocus_tensor is not None:
+                defocus_mean = defocus_tensor.mean().item()
+                defocus_std = defocus_tensor.std().item()
+                print(
+                    f"    Micrograph {i + 1} defocus: "
+                    f"mean={defocus_mean:.2f} Å, "
+                    f"std={defocus_std:.2f} Å"
+                )
+
     # Store final astigmatism values
     astigmatism_result = {}
     if refine_astigmatism:
@@ -755,9 +944,14 @@ def _micrograph_loop(
         astigmatism_result["angle"] = astigmatism_angle
         astigmatism_result["magnitude"] = astigmatism_magnitude
 
+    # Store final defocus values
+    defocus_result = None
+    if refine_defocus and defocus_tensor is not None:
+        defocus_result = defocus_tensor.detach()
+
     # Explicitly free particle backend kwargs and clear cache to reduce memory usage
     del particle_backend_kwargs
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    return micrograph_loss, astigmatism_result
+    return micrograph_loss, astigmatism_result, defocus_result

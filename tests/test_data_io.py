@@ -117,9 +117,11 @@ class TestWriteLossCsvs:
 
             # Check CSV content
             content = csv_path.read_text(encoding="utf-8")
-            assert "outer_iteration,loss" in content
-            assert "0,1.5" in content
-            assert "1,1.3" in content
+            assert "outer_iteration" in content or "outer_iteration" in content
+            assert "loss" in content
+            # Check that loss values are present (may have additional columns)
+            assert "1.5" in content
+            assert "1.3" in content
 
     def test_write_micrograph_losses(self):
         """Test writing micrograph losses to CSV."""
@@ -144,8 +146,10 @@ class TestWriteLossCsvs:
 
             # Check content
             content1 = csv1_path.read_text(encoding="utf-8")
-            assert "outer_iteration,loss" in content1
-            assert "0,1.5" in content1
+            assert "outer_iteration" in content1 or "outer_iteration" in content1
+            assert "loss" in content1
+            # Check that loss values are present (may have additional columns)
+            assert "1.5" in content1
 
     def test_write_both_losses(self):
         """Test writing both dataset and micrograph losses."""
@@ -167,6 +171,10 @@ class TestWriteLossCsvs:
             assert dataset_csv.exists()
             assert micrograph_csv.exists()
 
+            # Verify content exists
+            assert dataset_csv.read_text(encoding="utf-8")
+            assert micrograph_csv.read_text(encoding="utf-8")
+
     def test_write_creates_directory(self):
         """Test that function creates directory if it doesn't exist."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -180,3 +188,44 @@ class TestWriteLossCsvs:
 
             assert new_dir.exists()
             assert (new_dir / "dataset_losses.csv").exists()
+
+    def test_write_losses_with_parameters(self):
+        """Test writing losses with refined parameters included."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            params = {
+                "dataset_losses": [(0, 1.5), (1, 1.3)],
+                "micrograph_losses": {
+                    0: [(0, 1.5), (1, 1.2)],
+                },
+                "anistropic_mag": torch.tensor([[1.0, 0.1], [0.1, 1.0]]),
+                "odd_zernikes": {
+                    "Z31c": torch.tensor(0.123),
+                    "Z31s": torch.tensor(0.456),
+                },
+                "astigmatism_angle": torch.tensor([45.0]),
+                "astigmatism_magnitude": torch.tensor([100.0]),
+            }
+
+            write_loss_csvs(
+                refined_ctf_params=params,
+                output_directory=tmpdir,
+            )
+
+            # Check dataset losses CSV includes parameters
+            dataset_csv = Path(tmpdir) / "dataset_losses.csv"
+            assert dataset_csv.exists()
+            content = dataset_csv.read_text(encoding="utf-8")
+            assert "anisotropic_mag" in content
+            assert "Z31c" in content
+            assert "Z31s" in content
+            assert "0.123000" in content or "0.123" in content
+            assert "0.456000" in content or "0.456" in content
+
+            # Check micrograph losses CSV includes parameters
+            micrograph_csv = Path(tmpdir) / "micrograph_losses_1.csv"
+            assert micrograph_csv.exists()
+            content = micrograph_csv.read_text(encoding="utf-8")
+            assert "astigmatism_angle" in content
+            assert "astigmatism_magnitude" in content
+            assert "45.0" in content or "45.000000" in content
+            assert "100.0" in content or "100.000000" in content

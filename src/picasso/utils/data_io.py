@@ -300,13 +300,20 @@ def write_refined_ctf_params(
                     f.write(f"  Micrograph {i + 1}: {mag:.6f}\n")
             else:
                 f.write(f"{magnitudes}\n")
+            f.write("\n")
+
+        if "defocus_all" in refined_ctf_params:
+            f.write("Defocus Refinement:\n")
+            f.write("  Per-particle defocus refinement has been performed.\n")
+            f.write("  Refined defocus values are stored in the results CSV files.\n")
+            f.write("  (refined_relative_defocus or relative_defocus column)\n")
 
 
 def write_loss_csvs(
     refined_ctf_params: dict[str, Any],
     output_directory: str | os.PathLike | Path,
 ) -> None:
-    """Write loss values to CSV files.
+    """Write loss values and refined parameters to CSV files.
 
     Parameters
     ----------
@@ -328,17 +335,76 @@ def write_loss_csvs(
     if not os.access(output_dir, os.W_OK):
         raise ValueError(f"Directory '{output_dir}' does not permit writing.")
 
-    # Write dataset losses
+    # Extract dataset-level parameters
+    mag_matrix_str = None
+    z31c_val = None
+    z31s_val = None
+    if "anistropic_mag" in refined_ctf_params:
+        mag_matrix = refined_ctf_params["anistropic_mag"]
+        if isinstance(mag_matrix, torch.Tensor):
+            mag_matrix_np = mag_matrix.cpu().numpy()
+            # Convert to string format: [[a,b],[c,d]]
+            mag_matrix_str = (
+                f"[[{mag_matrix_np[0,0]:.6f},{mag_matrix_np[0,1]:.6f}],"
+                f"[{mag_matrix_np[1,0]:.6f},{mag_matrix_np[1,1]:.6f}]]"
+            )
+        else:
+            mag_matrix_str = str(mag_matrix)
+
+    if "odd_zernikes" in refined_ctf_params:
+        zernikes = refined_ctf_params["odd_zernikes"]
+        if "Z31c" in zernikes:
+            z31c = zernikes["Z31c"]
+            z31c_val = z31c.cpu().item() if isinstance(z31c, torch.Tensor) else z31c
+        if "Z31s" in zernikes:
+            z31s = zernikes["Z31s"]
+            z31s_val = z31s.cpu().item() if isinstance(z31s, torch.Tensor) else z31s
+
+    # Write dataset losses with dataset-level parameters
     if "dataset_losses" in refined_ctf_params:
         dataset_losses = refined_ctf_params["dataset_losses"]
         dataset_csv_path = output_dir / "dataset_losses.csv"
         with open(dataset_csv_path, "w", encoding="utf-8", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["outer_iteration", "loss"])
-            for outer_iter, loss_val in dataset_losses:
-                writer.writerow([outer_iter, loss_val])
+            # Build header with available parameters
+            header = ["outer_iteration", "loss"]
+            if mag_matrix_str is not None:
+                header.append("anisotropic_mag")
+            if z31c_val is not None:
+                header.append("Z31c")
+            if z31s_val is not None:
+                header.append("Z31s")
+            writer.writerow(header)
 
-    # Write micrograph losses
+            # Write data rows
+            for outer_iter, loss_val in dataset_losses:
+                row = [outer_iter, loss_val]
+                if mag_matrix_str is not None:
+                    row.append(mag_matrix_str)
+                if z31c_val is not None:
+                    row.append(f"{z31c_val:.6f}")
+                if z31s_val is not None:
+                    row.append(f"{z31s_val:.6f}")
+                writer.writerow(row)
+
+    # Extract per-micrograph parameters
+    astigmatism_angles = None
+    astigmatism_magnitudes = None
+    if "astigmatism_angle" in refined_ctf_params:
+        angles = refined_ctf_params["astigmatism_angle"]
+        if isinstance(angles, torch.Tensor):
+            astigmatism_angles = angles.cpu().numpy()
+        else:
+            astigmatism_angles = np.array(angles)
+
+    if "astigmatism_magnitude" in refined_ctf_params:
+        magnitudes = refined_ctf_params["astigmatism_magnitude"]
+        if isinstance(magnitudes, torch.Tensor):
+            astigmatism_magnitudes = magnitudes.cpu().numpy()
+        else:
+            astigmatism_magnitudes = np.array(magnitudes)
+
+    # Write micrograph losses with per-micrograph parameters
     if "micrograph_losses" in refined_ctf_params:
         micrograph_losses = refined_ctf_params["micrograph_losses"]
         for micrograph_num, losses in micrograph_losses.items():
@@ -347,6 +413,39 @@ def write_loss_csvs(
             )
             with open(micrograph_csv_path, "w", encoding="utf-8", newline="") as f:
                 writer = csv.writer(f)
-                writer.writerow(["outer_iteration", "loss"])
+                # Build header with available parameters
+                header = ["outer_iteration", "loss"]
+                if (
+                    astigmatism_angles is not None
+                    and micrograph_num < len(astigmatism_angles)
+                ):
+                    header.append("astigmatism_angle")
+                if (
+                    astigmatism_magnitudes is not None
+                    and micrograph_num < len(astigmatism_magnitudes)
+                ):
+                    header.append("astigmatism_magnitude")
+                writer.writerow(header)
+
+                # Get parameter values for this micrograph
+                astig_angle_val = None
+                astig_mag_val = None
+                if (
+                    astigmatism_angles is not None
+                    and micrograph_num < len(astigmatism_angles)
+                ):
+                    astig_angle_val = astigmatism_angles[micrograph_num]
+                if (
+                    astigmatism_magnitudes is not None
+                    and micrograph_num < len(astigmatism_magnitudes)
+                ):
+                    astig_mag_val = astigmatism_magnitudes[micrograph_num]
+
+                # Write data rows
                 for outer_iter, loss_val in losses:
-                    writer.writerow([outer_iter, loss_val])
+                    row = [outer_iter, loss_val]
+                    if astig_angle_val is not None:
+                        row.append(f"{astig_angle_val:.6f}")
+                    if astig_mag_val is not None:
+                        row.append(f"{astig_mag_val:.6f}")
+                    writer.writerow(row)
