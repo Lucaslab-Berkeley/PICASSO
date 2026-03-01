@@ -207,9 +207,13 @@ def main() -> None:
     print(mag_matrix.numpy() if isinstance(mag_matrix, torch.Tensor) else mag_matrix)
     print(f"\nMean pixel size: {args.mean_px:.6f}")
 
+    # Implied mean from axes (should match input mean_px for consistent matrix)
+    new_mean_px = (px_major + px_minor) / 2.0
+
     print("\nExtracted Pixel Size Measurements:")
     print(f"  Major axis pixel size: {px_major:.6f}")
     print(f"  Minor axis pixel size: {px_minor:.6f}")
+    print(f"  Implied mean px: {new_mean_px:.6f}")
     angle_deg = math.degrees(angle)
     if args.degrees:
         print(f"  Major axis angle: {angle_deg:.2f} degrees")
@@ -230,7 +234,9 @@ def main() -> None:
     )
     diff = torch.abs(mag_matrix - reconstructed).max().item()
     print(f"  Max difference between input and reconstructed matrix: {diff:.2e}")
-    if diff < 1e-5:
+    mean_diff = abs(new_mean_px - args.mean_px)
+    print(f"  Implied mean vs input mean_px difference: {mean_diff:.2e}")
+    if diff < 1e-5 and mean_diff < 1e-5:
         print("  Round-trip test passed!")
     else:
         print("  Warning: Round-trip test shows difference > 1e-5")

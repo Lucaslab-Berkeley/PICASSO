@@ -194,6 +194,7 @@ def read_refined_ctf_params(
         - "odd_zernikes": dict[str, torch.Tensor]
         - "astigmatism_angle": torch.Tensor
         - "astigmatism_magnitude": torch.Tensor
+        - "phase_shift_all": dict[int, torch.Tensor] (if phase shift was refined)
 
     Raises
     ------
@@ -308,6 +309,28 @@ def write_refined_ctf_params(
             f.write("  Refined defocus values are stored in the results CSV files.\n")
             f.write("  (refined_relative_defocus or relative_defocus column)\n")
 
+        if "phase_shift_all" in refined_ctf_params:
+            phase_shift_all = refined_ctf_params["phase_shift_all"]
+            f.write("\nPhase Shift (per micrograph):\n")
+            for mgraph_idx in sorted(phase_shift_all.keys()):
+                ps = phase_shift_all[mgraph_idx]
+                if isinstance(ps, torch.Tensor):
+                    ps_val = ps.cpu()
+                    if ps_val.numel() == 1:
+                        f.write(
+                            f"  Micrograph {mgraph_idx + 1}: {ps_val.item():.6f} rad\n"
+                        )
+                    else:
+                        # Per-particle: write mean ± std
+                        f.write(
+                            f"  Micrograph {mgraph_idx + 1}: "
+                            f"mean={ps_val.mean().item():.6f} rad, "
+                            f"std={ps_val.std().item():.6f} rad\n"
+                        )
+                else:
+                    f.write(f"  Micrograph {mgraph_idx + 1}: {ps:.6f} rad\n")
+            f.write("\n")
+
 
 def write_loss_csvs(
     refined_ctf_params: dict[str, Any],
@@ -345,8 +368,8 @@ def write_loss_csvs(
             mag_matrix_np = mag_matrix.cpu().numpy()
             # Convert to string format: [[a,b],[c,d]]
             mag_matrix_str = (
-                f"[[{mag_matrix_np[0,0]:.6f},{mag_matrix_np[0,1]:.6f}],"
-                f"[{mag_matrix_np[1,0]:.6f},{mag_matrix_np[1,1]:.6f}]]"
+                f"[[{mag_matrix_np[0, 0]:.6f},{mag_matrix_np[0, 1]:.6f}],"
+                f"[{mag_matrix_np[1, 0]:.6f},{mag_matrix_np[1, 1]:.6f}]]"
             )
         else:
             mag_matrix_str = str(mag_matrix)
@@ -415,14 +438,12 @@ def write_loss_csvs(
                 writer = csv.writer(f)
                 # Build header with available parameters
                 header = ["outer_iteration", "loss"]
-                if (
-                    astigmatism_angles is not None
-                    and micrograph_num < len(astigmatism_angles)
+                if astigmatism_angles is not None and micrograph_num < len(
+                    astigmatism_angles
                 ):
                     header.append("astigmatism_angle")
-                if (
-                    astigmatism_magnitudes is not None
-                    and micrograph_num < len(astigmatism_magnitudes)
+                if astigmatism_magnitudes is not None and micrograph_num < len(
+                    astigmatism_magnitudes
                 ):
                     header.append("astigmatism_magnitude")
                 writer.writerow(header)
@@ -430,14 +451,12 @@ def write_loss_csvs(
                 # Get parameter values for this micrograph
                 astig_angle_val = None
                 astig_mag_val = None
-                if (
-                    astigmatism_angles is not None
-                    and micrograph_num < len(astigmatism_angles)
+                if astigmatism_angles is not None and micrograph_num < len(
+                    astigmatism_angles
                 ):
                     astig_angle_val = astigmatism_angles[micrograph_num]
-                if (
-                    astigmatism_magnitudes is not None
-                    and micrograph_num < len(astigmatism_magnitudes)
+                if astigmatism_magnitudes is not None and micrograph_num < len(
+                    astigmatism_magnitudes
                 ):
                     astig_mag_val = astigmatism_magnitudes[micrograph_num]
 

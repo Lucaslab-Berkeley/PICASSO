@@ -242,6 +242,128 @@ def initialize_defocus_parameters(
     return defocus_tensor
 
 
+def initialize_phase_shift_parameters(
+    i: int,
+    particle_backend_kwargs: dict[str, Any],
+    device: torch.device,
+    phase_shift_mode: str,
+    initial_phase_shift: torch.Tensor | None,
+) -> torch.Tensor:
+    """Initialize phase_shift parameters for a micrograph.
+
+    Parameters
+    ----------
+    i : int
+        Micrograph index.
+    particle_backend_kwargs : dict[str, Any]
+        Particle backend kwargs containing CTF information.
+        Used to determine the number of particles and extract initial phase_shift.
+    device : torch.device
+        Device to use for tensors.
+    phase_shift_mode : str
+        Mode for phase_shift refinement: 'per_micrograph' or 'per_particle'.
+    initial_phase_shift : torch.Tensor | None
+        Initial phase_shift tensor. If provided, should have shape:
+        - (num_micrographs,) for per_micrograph mode
+        - (num_micrographs, num_particles) for per_particle mode
+
+    Returns
+    -------
+    torch.Tensor
+        Phase shift tensor initialized with requires_grad=True.
+        Shape depends on mode:
+        - per_micrograph: scalar tensor (shape [])
+        - per_particle: tensor with shape [num_particles]
+    """
+    # Get number of particles from defocus_u in particle_backend_kwargs
+    defocus_u = particle_backend_kwargs["defocus_u"]
+    if isinstance(defocus_u, torch.Tensor):
+        num_particles = defocus_u.shape[0]
+    else:
+        # If it's a scalar, assume single particle (shouldn't happen in practice)
+        num_particles = 1
+
+    # Get initial value from provided initial_phase_shift or particle_backend_kwargs
+    if initial_phase_shift is not None:
+        if phase_shift_mode == "per_micrograph":
+            # Expect shape (num_micrographs,)
+            initial_value = initial_phase_shift[i].to(device)
+        else:  # per_particle
+            # Expect shape (num_micrographs, num_particles) or dict with micrograph indices
+            if isinstance(initial_phase_shift, dict):
+                initial_value = initial_phase_shift[i].to(device)
+            else:
+                initial_value = initial_phase_shift[i].to(device)
+    else:
+        # Extract from particle_backend_kwargs
+        phase_shift_val = particle_backend_kwargs.get("ctf_kwargs", {}).get(
+            "phase_shift", 0.0
+        )
+
+        # Convert to tensor if needed
+        if not isinstance(phase_shift_val, torch.Tensor):
+            if phase_shift_mode == "per_micrograph":
+                initial_value = torch.tensor(phase_shift_val, device=device)
+            else:  # per_particle
+                # Create tensor for all particles with same initial value
+                initial_value = torch.full(
+                    (num_particles,), phase_shift_val, device=device
+                )
+        else:
+            phase_shift_val = phase_shift_val.to(device)
+            if phase_shift_mode == "per_micrograph":
+                # Take mean if it's per-particle tensor
+                if phase_shift_val.numel() > 1:
+                    initial_value = phase_shift_val.mean()
+                else:
+                    initial_value = phase_shift_val.squeeze()
+            else:  # per_particle
+                # Ensure it matches num_particles
+                if phase_shift_val.numel() == 1:
+                    # Broadcast scalar to all particles
+                    initial_value = phase_shift_val.expand(num_particles).clone()
+                else:
+                    initial_value = phase_shift_val
+
+    # Create tensor with requires_grad
+    if isinstance(initial_value, torch.Tensor):
+        phase_shift_tensor = initial_value.detach().clone().requires_grad_(True)
+    else:
+        phase_shift_tensor = torch.tensor(
+            initial_value, device=device, requires_grad=True
+        )
+
+    return phase_shift_tensor
+
+
+def get_non_refined_phase_shift_values(
+    particle_backend_kwargs: dict[str, Any],
+    device: torch.device,
+) -> torch.Tensor:
+    """Get phase_shift values when not refining phase_shift.
+
+    Parameters
+    ----------
+    particle_backend_kwargs : dict[str, Any]
+        Particle backend kwargs containing CTF information.
+    device : torch.device
+        Device to use for tensors.
+
+    Returns
+    -------
+    torch.Tensor
+        Phase shift tensor without gradients.
+    """
+    phase_shift_val = particle_backend_kwargs.get("ctf_kwargs", {}).get(
+        "phase_shift", 0.0
+    )
+
+    if isinstance(phase_shift_val, torch.Tensor):
+        return phase_shift_val.to(device)
+    else:
+        return torch.tensor(phase_shift_val, device=device)
+
+
 def setup_particle_backend_for_micrograph(
     results_path: str,
     template: torch.Tensor,
@@ -278,7 +400,7 @@ def setup_particle_backend_for_micrograph(
     apply_global_filtering : bool
         Whether to apply global filtering.
     anistropic_mag : torch.Tensor | None, optional
-        Anisotropic magnification matrix. If provided, used as transform_matrix.
+        Anisotropic magnification matrix. If provided, used as mag_matrix.
     odd_zernikes : dict[str, torch.Tensor] | None, optional
         Odd Zernike coefficients. If provided, added to CTF kwargs.
 
@@ -307,12 +429,12 @@ def setup_particle_backend_for_micrograph(
         defocus_offsets=defocus_offsets,
         pixel_size_offsets=pixel_size_offsets,
         apply_global_filtering=apply_global_filtering,
-        device_list=[str(device)],
+        device_list=[device],
     )
 
     # Change params for optimizable parameters
     if anistropic_mag is not None:
-        particle_backend_kwargs["transform_matrix"] = anistropic_mag
+        particle_backend_kwargs["mag_matrix"] = anistropic_mag
     if odd_zernikes is not None:
         # Convert from asinh space to actual values using sinh()
         # Scale factor matches the one used in setup_refinement_parameters
@@ -548,7 +670,7 @@ def setup_refinement_parameters(
             # asinh handles both positive and negative values smoothly
             asinh_z31c = torch.asinh(z31c_init / zernike_scale)
             asinh_z31s = torch.asinh(z31s_init / zernike_scale)
-            
+
             odd_zernikes = {
                 "asinh_Z31c": asinh_z31c.requires_grad_(True),
                 "asinh_Z31s": asinh_z31s.requires_grad_(True),
@@ -801,6 +923,7 @@ def create_final_results_dict(
     dataset_losses: list[tuple[int, float]],
     micrograph_losses: dict[int, list[tuple[int, float]]],
     defocus_all: dict[int, torch.Tensor] | None = None,
+    phase_shift_all: dict[int, torch.Tensor] | None = None,
 ) -> dict[str, Any]:
     """Create final results dictionary.
 
@@ -818,6 +941,8 @@ def create_final_results_dict(
         Micrograph-level loss history.
     defocus_all : dict[int, torch.Tensor] | None, optional
         Per-micrograph defocus tensors. If None, defocus was not refined.
+    phase_shift_all : dict[int, torch.Tensor] | None, optional
+        Per-micrograph phase_shift tensors. If None, phase_shift was not refined.
 
     Returns
     -------
@@ -830,8 +955,12 @@ def create_final_results_dict(
     result = {
         "anistropic_mag": setup_state["anistropic_mag"].detach(),
         "odd_zernikes": {
-            "Z31c": (zernike_scale * torch.sinh(odd_zernikes_asinh["asinh_Z31c"])).detach(),
-            "Z31s": (zernike_scale * torch.sinh(odd_zernikes_asinh["asinh_Z31s"])).detach(),
+            "Z31c": (
+                zernike_scale * torch.sinh(odd_zernikes_asinh["asinh_Z31c"])
+            ).detach(),
+            "Z31s": (
+                zernike_scale * torch.sinh(odd_zernikes_asinh["asinh_Z31s"])
+            ).detach(),
         },
         "astigmatism_angle": astigmatism_angle_all.detach(),
         "astigmatism_magnitude": astigmatism_magnitude_all.detach(),
@@ -841,6 +970,9 @@ def create_final_results_dict(
     # Only include defocus_all if it was refined (not None)
     if defocus_all is not None:
         result["defocus_all"] = {k: v.detach() for k, v in defocus_all.items()}
+    # Only include phase_shift_all if it was refined (not None)
+    if phase_shift_all is not None:
+        result["phase_shift_all"] = {k: v.detach() for k, v in phase_shift_all.items()}
     return result
 
 
@@ -880,12 +1012,16 @@ def accumulate_gradients_from_gpu_worker(
             if odd_zernikes["asinh_Z31c"].grad is None:
                 odd_zernikes["asinh_Z31c"].grad = grads["asinh_Z31c"].to(primary_device)
             else:
-                odd_zernikes["asinh_Z31c"].grad.add_(grads["asinh_Z31c"].to(primary_device))
+                odd_zernikes["asinh_Z31c"].grad.add_(
+                    grads["asinh_Z31c"].to(primary_device)
+                )
         if "asinh_Z31s" in grads:
             if odd_zernikes["asinh_Z31s"].grad is None:
                 odd_zernikes["asinh_Z31s"].grad = grads["asinh_Z31s"].to(primary_device)
             else:
-                odd_zernikes["asinh_Z31s"].grad.add_(grads["asinh_Z31s"].to(primary_device))
+                odd_zernikes["asinh_Z31s"].grad.add_(
+                    grads["asinh_Z31s"].to(primary_device)
+                )
 
 
 def collect_gradients_from_micrograph_loss(

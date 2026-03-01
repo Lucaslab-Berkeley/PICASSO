@@ -85,6 +85,8 @@ class CTFRefineManager(BaseModelPICASSO):
             "refine_astigmatism": self.ctf_refine_config.refine_astigmatism,
             "refine_beam_tilt": self.ctf_refine_config.refine_beam_tilt,
             "refine_defocus": self.ctf_refine_config.refine_defocus,
+            "refine_phase_shift": self.ctf_refine_config.refine_phase_shift,
+            "phase_shift_mode": self.ctf_refine_config.phase_shift_mode,
             "apply_global_filtering": self.ctf_refine_config.apply_global_filtering,
             "preprocessing_filters": self.preprocessing_filters,
             "batch_size": self.input_config.batch_size,
@@ -104,6 +106,7 @@ class CTFRefineManager(BaseModelPICASSO):
                 self.ctf_refine_config.astigmatism_magnitude_lr
             ),
             "defocus_lr": self.ctf_refine_config.defocus_lr,
+            "phase_shift_lr": self.ctf_refine_config.phase_shift_lr,
         }
 
         return backend_kwargs
@@ -146,6 +149,7 @@ class CTFRefineManager(BaseModelPICASSO):
         initial_odd_zernikes: dict[str, torch.Tensor] | None = None,
         initial_astigmatism_angle: torch.Tensor | None = None,
         initial_astigmatism_magnitude: torch.Tensor | None = None,
+        initial_phase_shift: torch.Tensor | None = None,
         initial_params_pkl_path: str | os.PathLike | Path | None = None,
     ) -> dict[str, Any]:
         """Refine the CTF parameters for the micrographs.
@@ -160,6 +164,8 @@ class CTFRefineManager(BaseModelPICASSO):
             Initial astigmatism angles for each micrograph. Defaults to None.
         initial_astigmatism_magnitude : torch.Tensor | None, optional
             Initial astigmatism magnitudes for each micrograph. Defaults to None.
+        initial_phase_shift : torch.Tensor | None, optional
+            Initial phase shift values. Defaults to None.
         initial_params_pkl_path : str | os.PathLike | Path | None, optional
             Path to a pickle file containing initial CTF parameters.
             If provided and explicit parameters are also given, explicit
@@ -173,6 +179,7 @@ class CTFRefineManager(BaseModelPICASSO):
             - "odd_zernikes": dict[str, torch.Tensor]
             - "astigmatism_angle": torch.Tensor
             - "astigmatism_magnitude": torch.Tensor
+            - "phase_shift_all": dict[int, torch.Tensor] (if refine_phase_shift is True)
         """
         backend_kwargs = self.setup_backend_kwargs()
 
@@ -188,6 +195,7 @@ class CTFRefineManager(BaseModelPICASSO):
                 initial_odd_zernikes is not None,
                 initial_astigmatism_angle is not None,
                 initial_astigmatism_magnitude is not None,
+                initial_phase_shift is not None,
             ]
         )
 
@@ -218,6 +226,10 @@ class CTFRefineManager(BaseModelPICASSO):
                 "astigmatism_magnitude"
             )
 
+        final_initial_phase_shift = initial_phase_shift
+        if final_initial_phase_shift is None and pkl_params is not None:
+            final_initial_phase_shift = pkl_params.get("phase_shift_all")
+
         # Choose core function based on optimizer type from config
         if self.ctf_refine_config.optimizer == "lbfgs":
             core_function = core_refine_ctf_lbfgs
@@ -230,6 +242,7 @@ class CTFRefineManager(BaseModelPICASSO):
             initial_odd_zernikes=final_initial_odd_zernikes,
             initial_astigmatism_angle=final_initial_astigmatism_angle,
             initial_astigmatism_magnitude=final_initial_astigmatism_magnitude,
+            initial_phase_shift=final_initial_phase_shift,
             output_directory=self.output_config.output_directory,
         )
 
@@ -410,12 +423,33 @@ class CTFRefineManager(BaseModelPICASSO):
                         existing_values = pd.to_numeric(
                             df["relative_defocus"], errors="coerce"
                         ).fillna(0.0)
-                        df["relative_defocus"] = (
-                            existing_values.values + defocus_values
-                        )
+                        df["relative_defocus"] = existing_values.values + defocus_values
                     else:
                         # Create refined_relative_defocus column if neither exists
                         df["refined_relative_defocus"] = defocus_values
+
+            # Update phase_shift values
+            if "phase_shift_all" in refined_ctf_params:
+                phase_shift_all = refined_ctf_params["phase_shift_all"]
+                if micrograph_idx in phase_shift_all:
+                    phase_shift_tensor = phase_shift_all[micrograph_idx]
+                    if isinstance(phase_shift_tensor, torch.Tensor):
+                        phase_shift_values = phase_shift_tensor.cpu().numpy()
+                    else:
+                        phase_shift_values = np.array(phase_shift_tensor)
+
+                    # Check if per-micrograph (scalar) or per-particle (array)
+                    if phase_shift_values.ndim == 0 or len(phase_shift_values) == 1:
+                        # Per-micrograph: single value for all particles
+                        phase_shift_val = float(phase_shift_values)
+                        if "phase_shift" not in df.columns:
+                            df["phase_shift"] = ""
+                        df["phase_shift"] = phase_shift_val
+                    else:
+                        # Per-particle: array of values
+                        if "phase_shift" not in df.columns:
+                            df["phase_shift"] = 0.0
+                        df["phase_shift"] = phase_shift_values
 
             # Create new filename: replace .csv with _ctf-refine.csv
             results_path = Path(results_file)

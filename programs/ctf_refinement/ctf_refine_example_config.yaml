@@ -38,6 +38,9 @@ computational_config:
 
 # CTF refinement configuration
 ctf_refine_config:
+  # Optimizer to use for CTF refinement: 'lbfgs' or 'adam'
+  # (optional, default: 'lbfgs')
+  optimizer: 'lbfgs'
   # Whether to refine anisotropic magnification (optional, default: false)
   refine_anisotropic_mag: false
   
@@ -46,6 +49,16 @@ ctf_refine_config:
   
   # Whether to refine beam tilt (optional, default: false)
   refine_beam_tilt: false
+  
+  # Whether to refine per-particle defocus (optional, default: false)
+  refine_defocus: false
+  
+  # Whether to refine phase shift (optional, default: false)
+  refine_phase_shift: false
+  
+  # Mode for phase shift refinement: 'per_micrograph' or 'per_particle'
+  # (optional, default: 'per_micrograph')
+  phase_shift_mode: 'per_micrograph'
   
   # Whether to apply global filtering to micrographs (optional, default: true)
   apply_global_filtering: true
