@@ -366,6 +366,65 @@ def _dataset_loop(
         refine_beam_tilt=refine_beam_tilt,
     )
 
+    # Store global initial parameter values for end-of-run comparison and revert
+    global_initial_anistropic_mag = anistropic_mag.detach().clone()
+    global_initial_odd_zernikes = {
+        k: v.detach().clone() for k, v in odd_zernikes.items()
+    }
+    global_initial_astigmatism_angle_all = astigmatism_angle_all.detach().clone()
+    global_initial_astigmatism_magnitude_all = (
+        astigmatism_magnitude_all.detach().clone()
+    )
+
+    # Compute initial total loss before any optimization (single-GPU forward pass)
+    _log_message("\nComputing initial loss before optimization...", log_file)
+    initial_total_loss: float = 0.0
+    for i, results_path in enumerate(results_files):
+        micrograph_loss_init, _, _, _ = _micrograph_loop(
+            i=i,
+            results_path=results_path,
+            template=templates[0],
+            template_box_size=template_box_size,
+            device=primary_device,
+            batch_size=batch_size,
+            per_micrograph_iterations=1,
+            outer_iteration=1,  # >0: loss-only, no optimization
+            refine_anisotropic_mag=refine_anisotropic_mag,
+            refine_astigmatism=refine_astigmatism,
+            refine_beam_tilt=refine_beam_tilt,
+            refine_defocus=refine_defocus,
+            refine_phase_shift=refine_phase_shift,
+            phase_shift_mode=phase_shift_mode,
+            apply_global_filtering=apply_global_filtering,
+            preprocessing_filters=preprocessing_filters,
+            convergence_threshold=convergence_threshold,
+            num_convergence_iterations=num_convergence_iterations,
+            astigmatism_angle_lr=astigmatism_angle_lr,
+            astigmatism_magnitude_lr=astigmatism_magnitude_lr,
+            defocus_lr=defocus_lr,
+            phase_shift_lr=phase_shift_lr,
+            lbfgs_max_eval=lbfgs_max_eval,
+            num_results_files=num_micrographs,
+            initial_astigmatism_angle=initial_astigmatism_angle,
+            initial_astigmatism_magnitude=initial_astigmatism_magnitude,
+            initial_phase_shift=initial_phase_shift,
+            setup_state=setup_state,
+        )
+        if micrograph_loss_init.numel() > 1:
+            loss_val_init = micrograph_loss_init.mean().item()
+        elif hasattr(micrograph_loss_init, "item"):
+            loss_val_init = micrograph_loss_init.item()
+        else:
+            loss_val_init = float(micrograph_loss_init)
+        initial_total_loss += loss_val_init
+        if primary_device.type == "cuda":
+            torch.cuda.empty_cache()
+    initial_avg_loss_global = initial_total_loss / num_micrographs
+    _log_message(
+        f"Initial avg loss (before any optimization): {initial_avg_loss_global:.6f}\n",
+        log_file,
+    )
+
     for outer_iteration in range(per_dataset_iterations):
         dataset_loss_value: float = 0.0
 
@@ -618,19 +677,6 @@ def _dataset_loop(
 
                 if primary_device.type == "cuda":
                     torch.cuda.empty_cache()
-
-        # Store initial dataset-level parameter values and loss before optimization
-        initial_anistropic_mag = None
-        initial_odd_zernikes = None
-        initial_dataset_loss = dataset_loss_value  # Already computed
-
-        if refine_anisotropic_mag and optimizer_aniso is not None:
-            initial_anistropic_mag = anistropic_mag.detach().clone()
-        if refine_beam_tilt and optimizer_beam_tilt is not None:
-            initial_odd_zernikes = {
-                "asinh_Z31c": odd_zernikes["asinh_Z31c"].detach().clone(),
-                "asinh_Z31s": odd_zernikes["asinh_Z31s"].detach().clone(),
-            }
 
         # Optimize dataset-level parameters with L-BFGS closure
         # Clear any accumulated gradients before closure (closure will recompute)
@@ -979,10 +1025,8 @@ def _dataset_loop(
                 refine_beam_tilt=refine_beam_tilt,
             )
 
-        # Recompute dataset loss after optimization to check if it improved
-        if (
-            refine_anisotropic_mag or refine_beam_tilt
-        ) and initial_dataset_loss is not None:
+        # Recompute dataset loss after dataset-level optimizer step
+        if refine_anisotropic_mag or refine_beam_tilt:
             final_dataset_loss_value: float = 0.0
 
             # Recompute loss for all micrographs with updated parameters
@@ -1121,45 +1165,12 @@ def _dataset_loop(
                     if primary_device.type == "cuda":
                         torch.cuda.empty_cache()
 
-            initial_avg_loss = initial_dataset_loss / num_micrographs
             final_avg_loss = final_dataset_loss_value / num_micrographs
-
-            # Revert if loss didn't improve
-            if final_avg_loss >= initial_avg_loss:
-                _log_message(
-                    f"Dataset-level optimization: Loss did not improve "
-                    f"(initial: {initial_avg_loss:.6f}, final: {final_avg_loss:.6f}). "
-                    f"Reverting to starting values.",
-                    log_file,
-                )
-                if refine_anisotropic_mag and initial_anistropic_mag is not None:
-                    anistropic_mag.data.copy_(initial_anistropic_mag)
-                if refine_beam_tilt and initial_odd_zernikes is not None:
-                    odd_zernikes["asinh_Z31c"].data.copy_(
-                        initial_odd_zernikes["asinh_Z31c"]
-                    )
-                    odd_zernikes["asinh_Z31s"].data.copy_(
-                        initial_odd_zernikes["asinh_Z31s"]
-                    )
-                # Update GPU-local copies if needed
-                if num_gpus > 1:
-                    update_gpu_setup_states(
-                        setup_states=setup_states,
-                        setup_state=setup_state,
-                        device_list=device_list,
-                        refine_anisotropic_mag=refine_anisotropic_mag,
-                        refine_beam_tilt=refine_beam_tilt,
-                    )
-                # Use initial loss
-                dataset_loss_value = initial_dataset_loss
-            else:
-                _log_message(
-                    f"Dataset-level optimization: Loss improved "
-                    f"(initial: {initial_avg_loss:.6f}, final: {final_avg_loss:.6f}). "
-                    f"Keeping optimized values.",
-                    log_file,
-                )
-                dataset_loss_value = final_dataset_loss_value
+            _log_message(
+                f"Dataset-level optimization: avg loss after step: {final_avg_loss:.6f}",
+                log_file,
+            )
+            dataset_loss_value = final_dataset_loss_value
 
         # Print statistics (show both asinh-space and actual values)
         zernike_scale = 1e6
@@ -1205,6 +1216,45 @@ def _dataset_loop(
         )
         if converged:
             break
+
+    # Final global check: revert ALL parameters to original if optimization did not help
+    final_avg_loss_global = (
+        dataset_losses[-1][1] if dataset_losses else initial_avg_loss_global
+    )
+    if final_avg_loss_global >= initial_avg_loss_global:
+        _log_message(
+            f"\nFinal global check: optimization did not improve overall loss "
+            f"(initial: {initial_avg_loss_global:.6f}, "
+            f"final: {final_avg_loss_global:.6f}). "
+            f"Reverting ALL parameters to original values.",
+            log_file,
+        )
+        if refine_anisotropic_mag:
+            anistropic_mag.data.copy_(global_initial_anistropic_mag)
+        if refine_beam_tilt:
+            for k in odd_zernikes:
+                odd_zernikes[k].data.copy_(global_initial_odd_zernikes[k])
+        if refine_astigmatism:
+            astigmatism_angle_all.data.copy_(global_initial_astigmatism_angle_all)
+            astigmatism_magnitude_all.data.copy_(global_initial_astigmatism_magnitude_all)
+        defocus_all.clear()
+        phase_shift_all.clear()
+        if num_gpus > 1:
+            update_gpu_setup_states(
+                setup_states=setup_states,
+                setup_state=setup_state,
+                device_list=device_list,
+                refine_anisotropic_mag=refine_anisotropic_mag,
+                refine_beam_tilt=refine_beam_tilt,
+            )
+    else:
+        _log_message(
+            f"\nFinal global check: optimization improved overall loss "
+            f"(initial: {initial_avg_loss_global:.6f}, "
+            f"final: {final_avg_loss_global:.6f}). "
+            f"Keeping all optimized values.",
+            log_file,
+        )
 
     if refine_anisotropic_mag:
         output_mag_matrix(anistropic_mag)
@@ -1462,78 +1512,6 @@ def _micrograph_loop(
     inner_iterations = per_micrograph_iterations if outer_iteration == 0 else 1
     # Track micrograph loss history for inner loop convergence
     micrograph_loss_history: list[float] = []
-
-    # Store initial parameter values and loss before optimization (for reverting if needed)
-    initial_astigmatism_angle = None
-    initial_astigmatism_magnitude_scaled = None
-    initial_defocus_tensor = None
-    initial_phase_shift_tensor = None
-    initial_loss_val = None
-    initial_micrograph_loss = None
-    if outer_iteration == 0:
-        # Compute initial loss before optimization
-        if refine_astigmatism:
-            # Unscale magnitude to get original value for calculations
-            astigmatism_magnitude_unscaled = astigmatism_magnitude_scaled * lr_ratio
-            defocus_u = initial_defocus_mean + astigmatism_magnitude_unscaled / 2.0
-            defocus_v = initial_defocus_mean - astigmatism_magnitude_unscaled / 2.0
-            num_particles = defocus_u.shape[0]
-            astigmatism_angle_broadcast = astigmatism_angle.expand(num_particles)
-            particle_backend_kwargs["defocus_u"] = defocus_u
-            particle_backend_kwargs["defocus_v"] = defocus_v
-            particle_backend_kwargs["defocus_angle"] = astigmatism_angle_broadcast
-            # Store initial values (store scaled version for astigmatism)
-            initial_astigmatism_angle = astigmatism_angle.detach().clone()
-            initial_astigmatism_magnitude_scaled = (
-                astigmatism_magnitude_scaled.detach().clone()
-            )
-
-        if refine_defocus and defocus_tensor is not None:
-            if refine_astigmatism:
-                particle_backend_kwargs["defocus_u"] = (
-                    particle_backend_kwargs["defocus_u"] + defocus_tensor
-                )
-                particle_backend_kwargs["defocus_v"] = (
-                    particle_backend_kwargs["defocus_v"] + defocus_tensor
-                )
-            else:
-                particle_backend_kwargs["defocus_u"] = (
-                    initial_defocus_u + defocus_tensor
-                )
-                particle_backend_kwargs["defocus_v"] = (
-                    initial_defocus_v + defocus_tensor
-                )
-            initial_defocus_tensor = defocus_tensor.detach().clone()
-
-        if refine_phase_shift and phase_shift_tensor is not None:
-            # Update phase_shift in CTF kwargs
-            if phase_shift_mode == "per_micrograph":
-                # Broadcast scalar to all particles
-                num_particles = (
-                    particle_backend_kwargs["defocus_u"].shape[0]
-                    if isinstance(particle_backend_kwargs["defocus_u"], torch.Tensor)
-                    else 1
-                )
-                phase_shift_broadcast = phase_shift_tensor.expand(num_particles)
-                particle_backend_kwargs["ctf_kwargs"]["phase_shift"] = (
-                    phase_shift_broadcast
-                )
-            else:  # per_particle
-                particle_backend_kwargs["ctf_kwargs"]["phase_shift"] = (
-                    phase_shift_tensor
-                )
-            initial_phase_shift_tensor = phase_shift_tensor.detach().clone()
-
-        # Compute initial loss
-        initial_micrograph_loss = compute_micrograph_loss(
-            particle_backend_kwargs=particle_backend_kwargs,
-            batch_size=batch_size,
-        )
-        initial_loss_val = get_loss_scalar(initial_micrograph_loss)
-        print(
-            f"  Micrograph {i + 1}/{num_results_files}, "
-            f"initial loss (before optimization): {initial_loss_val:.6f}"
-        )
 
     for inner_iter in range(inner_iterations):
         # Update defocus_u and defocus_v from astigmatism parameters if optimizing
@@ -2021,19 +1999,19 @@ def _micrograph_loop(
                     if phase_shift_mode == "per_micrograph":
                         # Broadcast scalar to all particles
                         num_particles = (
-                            particle_backend_kwargs["defocus_u"].shape[0]
+                            particle_backend_kwargs["defocus_u"].shape[0]  # noqa: F821
                             if isinstance(
-                                particle_backend_kwargs["defocus_u"],
+                                particle_backend_kwargs["defocus_u"],  # noqa: F821
                                 torch.Tensor,
                             )
                             else 1
                         )
                         phase_shift_broadcast = phase_shift_tensor.expand(num_particles)
-                        particle_backend_kwargs["ctf_kwargs"]["phase_shift"] = (
+                        particle_backend_kwargs["ctf_kwargs"]["phase_shift"] = (  # noqa: F821
                             phase_shift_broadcast
                         )
                     else:  # per_particle
-                        particle_backend_kwargs["ctf_kwargs"]["phase_shift"] = (
+                        particle_backend_kwargs["ctf_kwargs"]["phase_shift"] = (  # noqa: F821
                             phase_shift_tensor
                         )
 
@@ -2147,9 +2125,10 @@ def _micrograph_loop(
                         f"std={phase_shift_std:.4f} rad"
                     )
 
-    # Check if loss improved and revert if not (only on first outer iteration)
-    if outer_iteration == 0 and initial_loss_val is not None:
-        # Compute final loss after all optimizations
+    # After per-micrograph optimization on the first outer iteration, recompute loss
+    # with the fully optimized parameters to provide a clean computation graph for
+    # dataset-level gradient accumulation by the caller.
+    if outer_iteration == 0 and (refine_anisotropic_mag or refine_beam_tilt):
         if refine_astigmatism:
             # Unscale magnitude to get original value for calculations
             astigmatism_magnitude_unscaled = astigmatism_magnitude_scaled * lr_ratio
@@ -2178,9 +2157,7 @@ def _micrograph_loop(
                 )
 
         if refine_phase_shift and phase_shift_tensor is not None:
-            # Update phase_shift in CTF kwargs
             if phase_shift_mode == "per_micrograph":
-                # Broadcast scalar to all particles
                 num_particles = (
                     particle_backend_kwargs["defocus_u"].shape[0]
                     if isinstance(particle_backend_kwargs["defocus_u"], torch.Tensor)
@@ -2195,37 +2172,10 @@ def _micrograph_loop(
                     phase_shift_tensor
                 )
 
-        final_micrograph_loss = compute_micrograph_loss(
+        micrograph_loss = compute_micrograph_loss(
             particle_backend_kwargs=particle_backend_kwargs,
             batch_size=batch_size,
         )
-        final_loss_val = get_loss_scalar(final_micrograph_loss)
-
-        # Revert if loss didn't improve (higher loss is worse)
-        if final_loss_val >= initial_loss_val:
-            print(
-                f"  Micrograph {i + 1}: Loss did not improve "
-                f"(initial: {initial_loss_val:.6f}, final: {final_loss_val:.6f}). "
-                f"Reverting to starting values."
-            )
-            if refine_astigmatism and initial_astigmatism_angle is not None:
-                astigmatism_angle.data.copy_(initial_astigmatism_angle)
-                astigmatism_magnitude_scaled.data.copy_(
-                    initial_astigmatism_magnitude_scaled
-                )
-            if refine_defocus and initial_defocus_tensor is not None:
-                defocus_tensor.data.copy_(initial_defocus_tensor)
-            if refine_phase_shift and initial_phase_shift_tensor is not None:
-                phase_shift_tensor.data.copy_(initial_phase_shift_tensor)
-            # Use initial loss as final loss
-            micrograph_loss = initial_micrograph_loss
-        else:
-            print(
-                f"  Micrograph {i + 1}: Loss improved "
-                f"(initial: {initial_loss_val:.6f}, final: {final_loss_val:.6f}). "
-                f"Keeping optimized values."
-            )
-            micrograph_loss = final_micrograph_loss
 
     # Store final astigmatism values
     astigmatism_result = {}
