@@ -331,6 +331,19 @@ def write_refined_ctf_params(
                     f.write(f"  Micrograph {mgraph_idx + 1}: {ps:.6f} rad\n")
             f.write("\n")
 
+        if "phase_shift_quadratic_params_all" in refined_ctf_params:
+            quad_all = refined_ctf_params["phase_shift_quadratic_params_all"]
+            f.write("Phase Shift Quadratic (per micrograph):\n")
+            f.write("  C (degrees), g, k, alpha (radians)\n")
+            for mgraph_idx in sorted(quad_all.keys()):
+                p = quad_all[mgraph_idx]
+                f.write(
+                    f"  Micrograph {mgraph_idx + 1}: "
+                    f"C={p['C']:.6f}, g={p['g']:.6f}, k={p['k']:.6f}, "
+                    f"alpha={p['alpha']:.6f}\n"
+                )
+            f.write("\n")
+
 
 def write_loss_csvs(
     refined_ctf_params: dict[str, Any],

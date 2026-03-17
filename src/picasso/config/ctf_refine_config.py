@@ -28,6 +28,11 @@ class CtfRefineConfig(BaseModelPICASSO):
     astigmatism_magnitude_lr: float = 5.0
     defocus_lr: float = 5.0
     phase_shift_lr: float = 1.0
+    # Quadratic phase shift model (when phase_shift_mode == "quadratic")
+    phase_shift_quadratic_C: float | None = None  # degrees; if None, use mean from results
+    phase_shift_quadratic_g: float = 0.0
+    phase_shift_quadratic_k: float = 0.0
+    phase_shift_quadratic_alpha: float = 0.0  # radians
 
     @model_validator(mode="after")  # type: ignore
     def validate_optimizer(self) -> Self:
@@ -59,11 +64,15 @@ class CtfRefineConfig(BaseModelPICASSO):
             The validated instance.        Raises
         ------
         ValueError
-            If phase_shift_mode is not 'per_micrograph' or 'per_particle'.
+            If phase_shift_mode is not 'per_micrograph', 'per_particle', or 'quadratic'.
         """
-        if self.phase_shift_mode not in ("per_micrograph", "per_particle"):
+        if self.phase_shift_mode not in (
+            "per_micrograph",
+            "per_particle",
+            "quadratic",
+        ):
             raise ValueError(
-                f"phase_shift_mode must be 'per_micrograph' or 'per_particle', "
-                f"got '{self.phase_shift_mode}'"
+                "phase_shift_mode must be 'per_micrograph', 'per_particle', or "
+                f"'quadratic', got '{self.phase_shift_mode}'"
             )
         return self

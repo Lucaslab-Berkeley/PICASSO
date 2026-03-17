@@ -107,6 +107,18 @@ class CTFRefineManager(BaseModelPICASSO):
             ),
             "defocus_lr": self.ctf_refine_config.defocus_lr,
             "phase_shift_lr": self.ctf_refine_config.phase_shift_lr,
+            "initial_phase_shift_quadratic_C": (
+                self.ctf_refine_config.phase_shift_quadratic_C
+            ),
+            "initial_phase_shift_quadratic_g": (
+                self.ctf_refine_config.phase_shift_quadratic_g
+            ),
+            "initial_phase_shift_quadratic_k": (
+                self.ctf_refine_config.phase_shift_quadratic_k
+            ),
+            "initial_phase_shift_quadratic_alpha": (
+                self.ctf_refine_config.phase_shift_quadratic_alpha
+            ),
         }
 
         return backend_kwargs

@@ -6,10 +6,18 @@ from typing import Any, cast
 import numpy as np
 import pandas as pd
 import torch
+
+# Disable Dynamo before importing leopard_em so its compiled code is not used
+# (avoids "FX to symbolically trace a dynamo-optimized function" in refinement).
+if hasattr(torch, "_dynamo") and hasattr(torch._dynamo, "disable"):
+    torch._dynamo.disable()
+
 from leopard_em.backend.core_differentiable_refine import core_differentiable_refine
 from leopard_em.pydantic_models.config import PreprocessingFilters
 from leopard_em.pydantic_models.data_structures import ParticleStack
 from leopard_em.utils.backend_setup import setup_particle_backend_kwargs
+
+from picasso.utils.data_io import read_mrc_to_numpy
 
 
 def output_mag_matrix(mag_matrix: torch.Tensor) -> None:
@@ -242,13 +250,119 @@ def initialize_defocus_parameters(
     return defocus_tensor
 
 
+def get_particle_positions_normalized(
+    results_path: str,
+    device: torch.device,
+) -> torch.Tensor:
+    """Get normalized (x_norm, y_norm) positions in [0, 1] for quadratic phase shift.
+
+    Reads the results CSV, gets micrograph_path from the first row, loads the
+    micrograph MRC to obtain image dimensions, and normalizes pos_x_img and
+    pos_y_img columns.
+
+    Parameters
+    ----------
+    results_path : str
+        Path to the results CSV file.
+    device : torch.device
+        Device for the returned tensor.
+
+    Returns
+    -------
+    torch.Tensor
+        Shape (num_particles, 2) with (x_norm, y_norm) in [0, 1].
+    """
+    df = pd.read_csv(results_path)
+    if "micrograph_path" not in df.columns:
+        raise ValueError(
+            f"Results CSV at {results_path} must contain 'micrograph_path' column "
+            "for quadratic phase shift mode."
+        )
+    if "pos_x_img" not in df.columns or "pos_y_img" not in df.columns:
+        raise ValueError(
+            f"Results CSV at {results_path} must contain 'pos_x_img' and 'pos_y_img' "
+            "columns for quadratic phase shift mode."
+        )
+    micrograph_path = df["micrograph_path"].iloc[0]
+    micrograph = read_mrc_to_numpy(micrograph_path)
+    # MRC shape: (nz, ny, nx) for 3D or (ny, nx) for 2D
+    if micrograph.ndim == 3:
+        height, width = int(micrograph.shape[1]), int(micrograph.shape[2])
+    else:
+        height, width = int(micrograph.shape[0]), int(micrograph.shape[1])
+    pos_x = torch.tensor(
+        df["pos_x_img"].values.astype(np.float32), device=device, dtype=torch.float32
+    )
+    pos_y = torch.tensor(
+        df["pos_y_img"].values.astype(np.float32), device=device, dtype=torch.float32
+    )
+    x_norm = pos_x / width
+    y_norm = pos_y / height
+    return torch.stack([x_norm, y_norm], dim=-1)
+
+
+def phase_shift_quadratic_at_positions(
+    positions_norm_xy: torch.Tensor,
+    C: torch.Tensor,
+    g: torch.Tensor,
+    k: torch.Tensor,
+    alpha: torch.Tensor,
+) -> torch.Tensor:
+    """Evaluate quadratic phase shift model at normalized positions.
+
+    phase = C + g*s + k*s^2, s = x*cos(alpha) + y*sin(alpha),
+    with x, y in [-1, 1] from positions_norm_xy in [0, 1].
+
+    Parameters
+    ----------
+    positions_norm_xy : torch.Tensor
+        Shape (N, 2) with (x_norm, y_norm) in [0, 1].
+    C, g, k, alpha : torch.Tensor
+        Scalar parameters (C in degrees, alpha in radians).
+
+    Returns
+    -------
+    torch.Tensor
+        Shape (N,) phase shift in degrees, clamped to [0, 180].
+    """
+    x = 2.0 * positions_norm_xy[..., 0] - 1.0
+    y = 2.0 * positions_norm_xy[..., 1] - 1.0
+    s = x * torch.cos(alpha) + y * torch.sin(alpha)
+    phase = C + g * s + k * (s**2)
+    return torch.clamp(phase, min=0.0, max=180.0)
+
+
+def clamp_phase_shift_quadratic_after_step(
+    quad_params: dict[str, torch.nn.Parameter],
+) -> None:
+    """Clamp quadratic C to [0, 180] after optimizer step."""
+    with torch.no_grad():
+        quad_params["C"].clamp_(min=0.0, max=180.0)
+
+
+def quad_params_to_dict(
+    quad_params: dict[str, torch.nn.Parameter],
+) -> dict[str, float]:
+    """Convert quadratic phase shift params to a serializable dict (C in degrees, alpha in radians)."""
+    return {
+        "C": float(quad_params["C"].detach().cpu().item()),
+        "g": float(quad_params["g"].detach().cpu().item()),
+        "k": float(quad_params["k"].detach().cpu().item()),
+        "alpha": float(quad_params["alpha"].detach().cpu().item()),
+    }
+
+
 def initialize_phase_shift_parameters(
     i: int,
     particle_backend_kwargs: dict[str, Any],
     device: torch.device,
     phase_shift_mode: str,
     initial_phase_shift: torch.Tensor | None,
-) -> torch.Tensor:
+    initial_phase_shift_quadratic_C: float | None = None,
+    initial_phase_shift_quadratic_g: float = 0.0,
+    initial_phase_shift_quadratic_k: float = 0.0,
+    initial_phase_shift_quadratic_alpha: float = 0.0,
+) -> torch.Tensor | dict[str, torch.nn.Parameter]:
     """Initialize phase_shift parameters for a micrograph.
 
     Parameters
@@ -261,20 +375,74 @@ def initialize_phase_shift_parameters(
     device : torch.device
         Device to use for tensors.
     phase_shift_mode : str
-        Mode for phase_shift refinement: 'per_micrograph' or 'per_particle'.
+        Mode for phase_shift refinement: 'per_micrograph', 'per_particle', or 'quadratic'.
     initial_phase_shift : torch.Tensor | None
         Initial phase_shift tensor. If provided, should have shape:
         - (num_micrographs,) for per_micrograph mode
         - (num_micrographs, num_particles) for per_particle mode
+    initial_phase_shift_quadratic_C : float or None, optional
+        Initial C (degrees) for quadratic mode. If None, use mean phase shift
+        from the results file for this micrograph. Default 50.0 when not None.
+    initial_phase_shift_quadratic_g : float, optional
+        Initial g for quadratic mode. Default 0.0.
+    initial_phase_shift_quadratic_k : float, optional
+        Initial k for quadratic mode. Default 0.0.
+    initial_phase_shift_quadratic_alpha : float, optional
+        Initial alpha (radians) for quadratic mode. Default 0.0.
 
     Returns
     -------
-    torch.Tensor
-        Phase shift tensor initialized with requires_grad=True.
-        Shape depends on mode:
-        - per_micrograph: scalar tensor (shape [])
-        - per_particle: tensor with shape [num_particles]
+    torch.Tensor or dict[str, torch.nn.Parameter]
+        For per_micrograph/per_particle: phase shift tensor with requires_grad=True.
+        For quadratic: dict with keys "C", "g", "k", "alpha" of nn.Parameter.
     """
+    if phase_shift_mode == "quadratic":
+        # If C not given, use mean phase shift from results for this micrograph
+        if initial_phase_shift_quadratic_C is None:
+            phase_shift_val = particle_backend_kwargs.get("ctf_kwargs", {}).get(
+                "phase_shift", 0.0
+            )
+            if initial_phase_shift is not None:
+                val = initial_phase_shift[i]
+                if isinstance(val, torch.Tensor):
+                    initial_C = val.mean().item()
+                else:
+                    initial_C = float(val)
+            elif isinstance(phase_shift_val, torch.Tensor):
+                initial_C = phase_shift_val.mean().item()
+            else:
+                initial_C = float(phase_shift_val)
+        else:
+            initial_C = initial_phase_shift_quadratic_C
+
+        quad_params = {
+            "C": torch.nn.Parameter(
+                torch.tensor(initial_C, device=device, dtype=torch.float32)
+            ),
+            "g": torch.nn.Parameter(
+                torch.tensor(
+                    initial_phase_shift_quadratic_g,
+                    device=device,
+                    dtype=torch.float32,
+                )
+            ),
+            "k": torch.nn.Parameter(
+                torch.tensor(
+                    initial_phase_shift_quadratic_k,
+                    device=device,
+                    dtype=torch.float32,
+                )
+            ),
+            "alpha": torch.nn.Parameter(
+                torch.tensor(
+                    initial_phase_shift_quadratic_alpha,
+                    device=device,
+                    dtype=torch.float32,
+                )
+            ),
+        }
+        return quad_params
+
     # Get number of particles from defocus_u in particle_backend_kwargs
     defocus_u = particle_backend_kwargs["defocus_u"]
     if isinstance(defocus_u, torch.Tensor):
@@ -924,6 +1092,7 @@ def create_final_results_dict(
     micrograph_losses: dict[int, list[tuple[int, float]]],
     defocus_all: dict[int, torch.Tensor] | None = None,
     phase_shift_all: dict[int, torch.Tensor] | None = None,
+    phase_shift_quadratic_params_all: dict[int, dict[str, float]] | None = None,
 ) -> dict[str, Any]:
     """Create final results dictionary.
 
@@ -943,6 +1112,8 @@ def create_final_results_dict(
         Per-micrograph defocus tensors. If None, defocus was not refined.
     phase_shift_all : dict[int, torch.Tensor] | None, optional
         Per-micrograph phase_shift tensors. If None, phase_shift was not refined.
+    phase_shift_quadratic_params_all : dict[int, dict[str, float]] | None, optional
+        Per-micrograph quadratic params (C, g, k, alpha). If None, quadratic phase was not used.
 
     Returns
     -------
@@ -973,6 +1144,8 @@ def create_final_results_dict(
     # Only include phase_shift_all if it was refined (not None)
     if phase_shift_all is not None:
         result["phase_shift_all"] = {k: v.detach() for k, v in phase_shift_all.items()}
+    if phase_shift_quadratic_params_all is not None:
+        result["phase_shift_quadratic_params_all"] = phase_shift_quadratic_params_all
     return result
 
 

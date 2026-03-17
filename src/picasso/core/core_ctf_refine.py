@@ -12,6 +12,7 @@ from leopard_em.pydantic_models.config import PreprocessingFilters
 from picasso.core.core_ctf_refine_utils import (
     accumulate_gradients_from_gpu_worker,
     check_convergence,
+    clamp_phase_shift_quadratic_after_step,
     collect_gradients_from_micrograph_loss,
     compute_micrograph_loss,
     create_final_results_dict,
@@ -21,10 +22,13 @@ from picasso.core.core_ctf_refine_utils import (
     get_loss_scalar_tensor,
     get_non_refined_astigmatism_values,
     get_non_refined_phase_shift_values,
+    get_particle_positions_normalized,
     initialize_astigmatism_parameters,
     initialize_defocus_parameters,
     initialize_phase_shift_parameters,
     output_mag_matrix,
+    phase_shift_quadratic_at_positions,
+    quad_params_to_dict,
     setup_particle_backend_for_micrograph,
     setup_refinement_parameters,
     update_gpu_setup_states,
@@ -69,6 +73,10 @@ def core_refine_ctf(
     initial_astigmatism_angle: torch.Tensor | None = None,
     initial_astigmatism_magnitude: torch.Tensor | None = None,
     initial_phase_shift: torch.Tensor | None = None,
+    initial_phase_shift_quadratic_C: float | None = None,
+    initial_phase_shift_quadratic_g: float = 0.0,
+    initial_phase_shift_quadratic_k: float = 0.0,
+    initial_phase_shift_quadratic_alpha: float = 0.0,
     convergence_threshold: float = 0.0005,
     num_convergence_iterations: int = 5,
     lbfgs_max_eval: int = 5,  # pylint: disable=unused-argument
@@ -219,6 +227,10 @@ def core_refine_ctf(
             initial_astigmatism_angle=initial_astigmatism_angle,
             initial_astigmatism_magnitude=initial_astigmatism_magnitude,
             initial_phase_shift=initial_phase_shift,
+            initial_phase_shift_quadratic_C=initial_phase_shift_quadratic_C,
+            initial_phase_shift_quadratic_g=initial_phase_shift_quadratic_g,
+            initial_phase_shift_quadratic_k=initial_phase_shift_quadratic_k,
+            initial_phase_shift_quadratic_alpha=initial_phase_shift_quadratic_alpha,
             setup_state=setup_state,
             log_file=log_file,
         )
@@ -257,6 +269,10 @@ def _dataset_loop(
     initial_phase_shift: torch.Tensor | None,
     setup_state: dict[str, Any],
     log_file: Any = None,
+    initial_phase_shift_quadratic_C: float | None = None,
+    initial_phase_shift_quadratic_g: float = 0.0,
+    initial_phase_shift_quadratic_k: float = 0.0,
+    initial_phase_shift_quadratic_alpha: float = 0.0,
 ) -> dict[str, Any]:
     """Run the outer dataset loop for dataset-level optimization.
 
@@ -336,10 +352,34 @@ def _dataset_loop(
 
     # Store phase_shift results per micrograph
     phase_shift_all: dict[int, torch.Tensor] = {}
+    phase_shift_quadratic_params_all: dict[int, dict[str, float]] = {}
+
+    # Pre-populate quadratic params with initial values for every micrograph so that
+    # micrographs whose loss does not improve still appear in the output with their
+    # starting values (C from config or mean phase shift; g/k/alpha from config).
+    if refine_phase_shift and phase_shift_mode == "quadratic":
+        for i in range(len(results_files)):
+            if initial_phase_shift_quadratic_C is not None:
+                init_C = initial_phase_shift_quadratic_C
+            elif initial_phase_shift is not None:
+                val = initial_phase_shift[i]
+                init_C = (
+                    float(val.mean()) if isinstance(val, torch.Tensor) else float(val)
+                )
+            else:
+                init_C = 0.0
+            phase_shift_quadratic_params_all[i] = {
+                "C": init_C,
+                "g": initial_phase_shift_quadratic_g,
+                "k": initial_phase_shift_quadratic_k,
+                "alpha": initial_phase_shift_quadratic_alpha,
+            }
 
     loss_history: list[float] = []
     dataset_losses: list[tuple[int, float]] = []
     micrograph_losses: dict[int, list[tuple[int, float]]] = {}
+    # Per-micrograph baseline losses (best-so-far, updated when a micrograph improves)
+    initial_micrograph_losses: dict[int, float] = {}
     num_micrographs = len(results_files)
 
     # Distribute micrographs across GPUs
@@ -363,21 +403,17 @@ def _dataset_loop(
         refine_beam_tilt=refine_beam_tilt,
     )
 
-    # Store global initial parameter values for end-of-run comparison and revert
+    # Store global initial parameter values for dataset-level revert
     global_initial_anistropic_mag = anistropic_mag.detach().clone()
     global_initial_odd_zernikes = {
         k: v.detach().clone() for k, v in odd_zernikes.items()
     }
-    global_initial_astigmatism_angle_all = astigmatism_angle_all.detach().clone()
-    global_initial_astigmatism_magnitude_all = (
-        astigmatism_magnitude_all.detach().clone()
-    )
 
     # Compute initial total loss before any optimization (single-GPU forward pass)
     _log_message("\nComputing initial loss before optimization...", log_file)
     initial_total_loss: float = 0.0
     for i, results_path in enumerate(results_files):
-        micrograph_loss_init, _, _, _ = _micrograph_loop(
+        micrograph_loss_init, _, _, _, _ = _micrograph_loop(
             i=i,
             results_path=results_path,
             template=templates[0],
@@ -404,6 +440,10 @@ def _dataset_loop(
             initial_astigmatism_angle=initial_astigmatism_angle,
             initial_astigmatism_magnitude=initial_astigmatism_magnitude,
             initial_phase_shift=initial_phase_shift,
+            initial_phase_shift_quadratic_C=initial_phase_shift_quadratic_C,
+            initial_phase_shift_quadratic_g=initial_phase_shift_quadratic_g,
+            initial_phase_shift_quadratic_k=initial_phase_shift_quadratic_k,
+            initial_phase_shift_quadratic_alpha=initial_phase_shift_quadratic_alpha,
             setup_state=setup_state,
         )
         if micrograph_loss_init.numel() > 1:
@@ -412,6 +452,7 @@ def _dataset_loop(
             loss_val_init = micrograph_loss_init.item()
         else:
             loss_val_init = float(micrograph_loss_init)
+        initial_micrograph_losses[i] = loss_val_init
         initial_total_loss += loss_val_init
         if primary_device.type == "cuda":
             torch.cuda.empty_cache()
@@ -465,6 +506,7 @@ def _dataset_loop(
                         astigmatism_result,
                         defocus_result,
                         phase_shift_result,
+                        phase_shift_quadratic_params_result,
                     ) = _micrograph_loop(
                         i=i,
                         results_path=results_path,
@@ -492,6 +534,10 @@ def _dataset_loop(
                         initial_astigmatism_angle=initial_astigmatism_angle,
                         initial_astigmatism_magnitude=initial_astigmatism_magnitude,
                         initial_phase_shift=initial_phase_shift,
+                        initial_phase_shift_quadratic_C=initial_phase_shift_quadratic_C,
+                        initial_phase_shift_quadratic_g=initial_phase_shift_quadratic_g,
+                        initial_phase_shift_quadratic_k=initial_phase_shift_quadratic_k,
+                        initial_phase_shift_quadratic_alpha=initial_phase_shift_quadratic_alpha,
                         setup_state=local_setup,
                     )
 
@@ -521,17 +567,20 @@ def _dataset_loop(
                         refine_beam_tilt=refine_beam_tilt,
                     )
 
-                    queue.put(
-                        {
-                            "index": i,
-                            "loss": loss_val,
-                            "astigmatism_angle": astigmatism_result["angle"],
-                            "astigmatism_magnitude": astigmatism_result["magnitude"],
-                            "defocus": defocus_result,
-                            "phase_shift": phase_shift_result,
-                            "grads": grads,
-                        }
-                    )
+                    result_dict: dict[str, Any] = {
+                        "index": i,
+                        "loss": loss_val,
+                        "astigmatism_angle": astigmatism_result["angle"],
+                        "astigmatism_magnitude": astigmatism_result["magnitude"],
+                        "defocus": defocus_result,
+                        "phase_shift": phase_shift_result,
+                        "grads": grads,
+                    }
+                    if phase_shift_quadratic_params_result is not None:
+                        result_dict["phase_shift_quadratic_params"] = (
+                            phase_shift_quadratic_params_result
+                        )
+                    queue.put(result_dict)
 
                     # Free memory
                     del micrograph_loss
@@ -562,21 +611,29 @@ def _dataset_loop(
                 i = result["index"]
                 loss_val = result["loss"]
 
-                astigmatism_angle_all[i] = result["astigmatism_angle"].to(
-                    primary_device
-                )
-                astigmatism_magnitude_all[i] = result["astigmatism_magnitude"].to(
-                    primary_device
-                )
-                if refine_defocus and result.get("defocus") is not None:
-                    defocus_all[i] = result["defocus"].to(primary_device)
-                if refine_phase_shift and result.get("phase_shift") is not None:
-                    phase_shift_all[i] = result["phase_shift"].to(primary_device)
-
                 if i not in micrograph_losses:
                     micrograph_losses[i] = []
                 micrograph_losses[i].append((outer_iteration, loss_val))
                 dataset_loss_value += loss_val
+
+                # Per-micrograph accept/reject: keep only if this micrograph improved
+                baseline_loss_i = initial_micrograph_losses.get(i, float("inf"))
+                if loss_val < baseline_loss_i:
+                    astigmatism_angle_all[i] = result["astigmatism_angle"].to(
+                        primary_device
+                    )
+                    astigmatism_magnitude_all[i] = result["astigmatism_magnitude"].to(
+                        primary_device
+                    )
+                    if refine_defocus and result.get("defocus") is not None:
+                        defocus_all[i] = result["defocus"].to(primary_device)
+                    if refine_phase_shift and result.get("phase_shift") is not None:
+                        phase_shift_all[i] = result["phase_shift"].to(primary_device)
+                    if result.get("phase_shift_quadratic_params") is not None:
+                        phase_shift_quadratic_params_all[i] = result[
+                            "phase_shift_quadratic_params"
+                        ]
+                    initial_micrograph_losses[i] = loss_val
 
                 # Accumulate gradients from GPU-local parameters to master parameters
                 grads = result.get("grads", {})
@@ -592,11 +649,16 @@ def _dataset_loop(
         else:
             # Single GPU path
             for i, results_path in enumerate(results_files):
+                # Save astigmatism before optimization for per-micrograph revert
+                saved_astig_angle_i = astigmatism_angle_all[i].clone()
+                saved_astig_magnitude_i = astigmatism_magnitude_all[i].clone()
+
                 (
                     micrograph_loss,
                     astigmatism_result,
                     defocus_result,
                     phase_shift_result,
+                    phase_shift_quadratic_params_result,
                 ) = _micrograph_loop(
                     i=i,
                     results_path=results_path,
@@ -624,15 +686,12 @@ def _dataset_loop(
                     initial_astigmatism_angle=initial_astigmatism_angle,
                     initial_astigmatism_magnitude=initial_astigmatism_magnitude,
                     initial_phase_shift=initial_phase_shift,
+                    initial_phase_shift_quadratic_C=initial_phase_shift_quadratic_C,
+                    initial_phase_shift_quadratic_g=initial_phase_shift_quadratic_g,
+                    initial_phase_shift_quadratic_k=initial_phase_shift_quadratic_k,
+                    initial_phase_shift_quadratic_alpha=initial_phase_shift_quadratic_alpha,
                     setup_state=setup_state,
                 )
-
-                astigmatism_angle_all[i] = astigmatism_result["angle"]
-                astigmatism_magnitude_all[i] = astigmatism_result["magnitude"]
-                if refine_defocus and defocus_result is not None:
-                    defocus_all[i] = defocus_result
-                if refine_phase_shift and phase_shift_result is not None:
-                    phase_shift_all[i] = phase_shift_result
 
                 if i not in micrograph_losses:
                     micrograph_losses[i] = []
@@ -645,6 +704,25 @@ def _dataset_loop(
                     loss_val = float(micrograph_loss)
                 micrograph_losses[i].append((outer_iteration, loss_val))
                 dataset_loss_value += loss_val
+
+                # Per-micrograph accept/reject: keep only if this micrograph improved
+                baseline_loss_i = initial_micrograph_losses.get(i, float("inf"))
+                if loss_val < baseline_loss_i:
+                    astigmatism_angle_all[i] = astigmatism_result["angle"]
+                    astigmatism_magnitude_all[i] = astigmatism_result["magnitude"]
+                    if refine_defocus and defocus_result is not None:
+                        defocus_all[i] = defocus_result
+                    if refine_phase_shift and phase_shift_result is not None:
+                        phase_shift_all[i] = phase_shift_result
+                    if phase_shift_quadratic_params_result is not None:
+                        phase_shift_quadratic_params_all[i] = (
+                            phase_shift_quadratic_params_result
+                        )
+                    initial_micrograph_losses[i] = loss_val
+                else:
+                    # Revert astigmatism; leave defocus/phase_shift unchanged
+                    astigmatism_angle_all[i] = saved_astig_angle_i
+                    astigmatism_magnitude_all[i] = saved_astig_magnitude_i
 
                 if refine_anisotropic_mag or refine_beam_tilt:
                     if micrograph_loss.numel() > 1:
@@ -743,7 +821,7 @@ def _dataset_loop(
                             break
 
                         results_path = results_files[i]
-                        micrograph_loss, _, _, _ = _micrograph_loop(
+                        micrograph_loss, _, _, _, _ = _micrograph_loop(
                             i=i,
                             results_path=results_path,
                             template=local_template,
@@ -770,6 +848,10 @@ def _dataset_loop(
                             initial_astigmatism_angle=initial_astigmatism_angle,
                             initial_astigmatism_magnitude=initial_astigmatism_magnitude,
                             initial_phase_shift=initial_phase_shift,
+                            initial_phase_shift_quadratic_C=initial_phase_shift_quadratic_C,
+                            initial_phase_shift_quadratic_g=initial_phase_shift_quadratic_g,
+                            initial_phase_shift_quadratic_k=initial_phase_shift_quadratic_k,
+                            initial_phase_shift_quadratic_alpha=initial_phase_shift_quadratic_alpha,
                             setup_state=local_setup,
                         )
 
@@ -808,7 +890,7 @@ def _dataset_loop(
             else:
                 # Single GPU path
                 for i, results_path in enumerate(results_files):
-                    micrograph_loss, _, _, _ = _micrograph_loop(
+                    micrograph_loss, _, _, _, _ = _micrograph_loop(
                         i=i,
                         results_path=results_path,
                         template=template,
@@ -835,6 +917,10 @@ def _dataset_loop(
                         initial_astigmatism_angle=initial_astigmatism_angle,
                         initial_astigmatism_magnitude=initial_astigmatism_magnitude,
                         initial_phase_shift=initial_phase_shift,
+                        initial_phase_shift_quadratic_C=initial_phase_shift_quadratic_C,
+                        initial_phase_shift_quadratic_g=initial_phase_shift_quadratic_g,
+                        initial_phase_shift_quadratic_k=initial_phase_shift_quadratic_k,
+                        initial_phase_shift_quadratic_alpha=initial_phase_shift_quadratic_alpha,
                         setup_state=setup_state,
                     )
 
@@ -902,16 +988,19 @@ def _dataset_loop(
         if converged:
             break
 
-    # Final global check: revert ALL parameters to original if optimization did not help
+    # Final global check: revert dataset-level parameters if optimization did not help.
+    # Per-micrograph parameters (astigmatism, defocus, phase shift) are already
+    # accepted/rejected independently per micrograph above, so only dataset-level
+    # parameters (anisotropic mag, beam tilt) are reverted here.
     final_avg_loss_global = (
         dataset_losses[-1][1] if dataset_losses else initial_avg_loss_global
     )
     if final_avg_loss_global >= initial_avg_loss_global:
         _log_message(
-            f"\nFinal global check: optimization did not improve overall loss "
-            f"(initial: {initial_avg_loss_global:.6f}, "
+            f"\nFinal global check: dataset-level optimization did not improve overall "
+            f"loss (initial: {initial_avg_loss_global:.6f}, "
             f"final: {final_avg_loss_global:.6f}). "
-            f"Reverting ALL parameters to original values.",
+            f"Reverting dataset-level parameters (anisotropic mag, beam tilt).",
             log_file,
         )
         if refine_anisotropic_mag:
@@ -919,11 +1008,6 @@ def _dataset_loop(
         if refine_beam_tilt:
             for k in odd_zernikes:
                 odd_zernikes[k].data.copy_(global_initial_odd_zernikes[k])
-        if refine_astigmatism:
-            astigmatism_angle_all.data.copy_(global_initial_astigmatism_angle_all)
-            astigmatism_magnitude_all.data.copy_(global_initial_astigmatism_magnitude_all)
-        defocus_all.clear()
-        phase_shift_all.clear()
         if num_gpus > 1:
             update_gpu_setup_states(
                 setup_states=setup_states,
@@ -952,6 +1036,11 @@ def _dataset_loop(
         micrograph_losses=micrograph_losses,
         defocus_all=defocus_all if refine_defocus else None,
         phase_shift_all=phase_shift_all if refine_phase_shift else None,
+        phase_shift_quadratic_params_all=(
+            phase_shift_quadratic_params_all
+            if refine_phase_shift and phase_shift_mode == "quadratic"
+            else None
+        ),
     )
 
 
@@ -987,7 +1076,17 @@ def _micrograph_loop(
     initial_astigmatism_magnitude: torch.Tensor | None,
     initial_phase_shift: torch.Tensor | None,
     setup_state: dict[str, Any],
-) -> tuple[torch.Tensor, dict[str, Any], torch.Tensor | None, torch.Tensor | None]:
+    initial_phase_shift_quadratic_C: float | None = None,
+    initial_phase_shift_quadratic_g: float = 0.0,
+    initial_phase_shift_quadratic_k: float = 0.0,
+    initial_phase_shift_quadratic_alpha: float = 0.0,
+) -> tuple[
+    torch.Tensor,
+    dict[str, Any],
+    torch.Tensor | None,
+    torch.Tensor | None,
+    dict[str, float] | None,
+]:
     """Process a single micrograph through inner iterations.
 
     Parameters
@@ -1131,18 +1230,34 @@ def _micrograph_loop(
     # Initialize phase_shift parameters for this micrograph
     optimizer_phase_shift = None
     phase_shift_tensor = None
+    quad_params: dict[str, torch.nn.Parameter] | None = None
+    positions_normalized: torch.Tensor | None = None
     if refine_phase_shift:
-        phase_shift_tensor = initialize_phase_shift_parameters(
+        init_result = initialize_phase_shift_parameters(
             i=i,
             particle_backend_kwargs=particle_backend_kwargs,
             device=device,
             phase_shift_mode=phase_shift_mode,
             initial_phase_shift=initial_phase_shift,
+            initial_phase_shift_quadratic_C=initial_phase_shift_quadratic_C,
+            initial_phase_shift_quadratic_g=initial_phase_shift_quadratic_g,
+            initial_phase_shift_quadratic_k=initial_phase_shift_quadratic_k,
+            initial_phase_shift_quadratic_alpha=initial_phase_shift_quadratic_alpha,
         )
-
-        optimizer_phase_shift = torch.optim.Adam(
-            [phase_shift_tensor], lr=phase_shift_lr
-        )
+        if phase_shift_mode == "quadratic" and isinstance(init_result, dict):
+            quad_params = init_result
+            positions_normalized = get_particle_positions_normalized(
+                results_path, device
+            )
+            phase_shift_tensor = None
+            optimizer_phase_shift = torch.optim.Adam(
+                list(quad_params.values()), lr=phase_shift_lr
+            )
+        else:
+            phase_shift_tensor = init_result  # type: ignore[assignment]
+            optimizer_phase_shift = torch.optim.Adam(
+                [phase_shift_tensor], lr=phase_shift_lr
+            )
     else:
         phase_shift_tensor = get_non_refined_phase_shift_values(
             particle_backend_kwargs=particle_backend_kwargs,
@@ -1178,22 +1293,35 @@ def _micrograph_loop(
             particle_backend_kwargs["defocus_v"] = initial_defocus_v + defocus_tensor
 
         # Update phase_shift in CTF kwargs if optimizing
-        if refine_phase_shift and phase_shift_tensor is not None:
-            if phase_shift_mode == "per_micrograph":
-                # Broadcast scalar to all particles
-                num_particles = (
-                    particle_backend_kwargs["defocus_u"].shape[0]
-                    if isinstance(particle_backend_kwargs["defocus_u"], torch.Tensor)
-                    else 1
-                )
-                phase_shift_broadcast = phase_shift_tensor.expand(num_particles)
+        if refine_phase_shift:
+            if quad_params is not None and positions_normalized is not None:
                 particle_backend_kwargs["ctf_kwargs"]["phase_shift"] = (
-                    phase_shift_broadcast
+                    phase_shift_quadratic_at_positions(
+                        positions_normalized,
+                        quad_params["C"],
+                        quad_params["g"],
+                        quad_params["k"],
+                        quad_params["alpha"],
+                    )
                 )
-            else:  # per_particle
-                particle_backend_kwargs["ctf_kwargs"]["phase_shift"] = (
-                    phase_shift_tensor
-                )
+            elif phase_shift_tensor is not None:
+                if phase_shift_mode == "per_micrograph":
+                    # Broadcast scalar to all particles
+                    num_particles = (
+                        particle_backend_kwargs["defocus_u"].shape[0]
+                        if isinstance(
+                            particle_backend_kwargs["defocus_u"], torch.Tensor
+                        )
+                        else 1
+                    )
+                    phase_shift_broadcast = phase_shift_tensor.expand(num_particles)
+                    particle_backend_kwargs["ctf_kwargs"]["phase_shift"] = (
+                        phase_shift_broadcast
+                    )
+                else:  # per_particle
+                    particle_backend_kwargs["ctf_kwargs"]["phase_shift"] = (
+                        phase_shift_tensor
+                    )
 
         micrograph_loss = compute_micrograph_loss(
             particle_backend_kwargs=particle_backend_kwargs,
@@ -1302,8 +1430,17 @@ def _micrograph_loop(
             retain_graph = refine_anisotropic_mag or refine_beam_tilt
             micrograph_loss_scalar.backward(retain_graph=retain_graph)
             optimizer_phase_shift.step()
+            if quad_params is not None:
+                clamp_phase_shift_quadratic_after_step(quad_params)
             # Print phase_shift statistics after optimization
-            if phase_shift_tensor is not None:
+            if quad_params is not None:
+                q = quad_params
+                print(
+                    f"    Micrograph {i + 1} phase_shift (quadratic): "
+                    f"C={q['C'].item():.4f}°, g={q['g'].item():.4f}, "
+                    f"k={q['k'].item():.4f}, alpha={q['alpha'].item():.4f} rad"
+                )
+            elif phase_shift_tensor is not None:
                 if phase_shift_mode == "per_micrograph":
                     phase_shift_val = phase_shift_tensor.item()
                     print(
@@ -1347,21 +1484,34 @@ def _micrograph_loop(
                     initial_defocus_v + defocus_tensor
                 )
 
-        if refine_phase_shift and phase_shift_tensor is not None:
-            if phase_shift_mode == "per_micrograph":
-                num_particles = (
-                    particle_backend_kwargs["defocus_u"].shape[0]
-                    if isinstance(particle_backend_kwargs["defocus_u"], torch.Tensor)
-                    else 1
-                )
-                phase_shift_broadcast = phase_shift_tensor.expand(num_particles)
+        if refine_phase_shift:
+            if quad_params is not None and positions_normalized is not None:
                 particle_backend_kwargs["ctf_kwargs"]["phase_shift"] = (
-                    phase_shift_broadcast
+                    phase_shift_quadratic_at_positions(
+                        positions_normalized,
+                        quad_params["C"],
+                        quad_params["g"],
+                        quad_params["k"],
+                        quad_params["alpha"],
+                    )
                 )
-            else:  # per_particle
-                particle_backend_kwargs["ctf_kwargs"]["phase_shift"] = (
-                    phase_shift_tensor
-                )
+            elif phase_shift_tensor is not None:
+                if phase_shift_mode == "per_micrograph":
+                    num_particles = (
+                        particle_backend_kwargs["defocus_u"].shape[0]
+                        if isinstance(
+                            particle_backend_kwargs["defocus_u"], torch.Tensor
+                        )
+                        else 1
+                    )
+                    phase_shift_broadcast = phase_shift_tensor.expand(num_particles)
+                    particle_backend_kwargs["ctf_kwargs"]["phase_shift"] = (
+                        phase_shift_broadcast
+                    )
+                else:  # per_particle
+                    particle_backend_kwargs["ctf_kwargs"]["phase_shift"] = (
+                        phase_shift_tensor
+                    )
 
         micrograph_loss = compute_micrograph_loss(
             particle_backend_kwargs=particle_backend_kwargs,
@@ -1384,12 +1534,29 @@ def _micrograph_loop(
 
     # Store final phase_shift values
     phase_shift_result = None
-    if refine_phase_shift and phase_shift_tensor is not None:
-        phase_shift_result = phase_shift_tensor.detach()
+    phase_shift_quadratic_params_result: dict[str, float] | None = None
+    if refine_phase_shift:
+        if quad_params is not None and positions_normalized is not None:
+            phase_shift_result = phase_shift_quadratic_at_positions(
+                positions_normalized,
+                quad_params["C"],
+                quad_params["g"],
+                quad_params["k"],
+                quad_params["alpha"],
+            ).detach()
+            phase_shift_quadratic_params_result = quad_params_to_dict(quad_params)
+        elif phase_shift_tensor is not None:
+            phase_shift_result = phase_shift_tensor.detach()
 
     # Explicitly free particle backend kwargs and clear cache to reduce memory usage
     del particle_backend_kwargs
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    return micrograph_loss, astigmatism_result, defocus_result, phase_shift_result
+    return (
+        micrograph_loss,
+        astigmatism_result,
+        defocus_result,
+        phase_shift_result,
+        phase_shift_quadratic_params_result,
+    )
