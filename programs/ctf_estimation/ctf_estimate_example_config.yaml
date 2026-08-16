@@ -1,0 +1,73 @@
+# Example configuration for CTF estimation in PICASSO
+# Maps to Leopard-EM OpticsGroup (defocus in Å) plus a metrics table.
+# Recommended route for untilted 300 kV movies: 1D → 2D defocus, then
+# 1D thickness grid + thickness-only Adam. See
+# test_datasets/no-laser/PICASSO_results/RECOMMENDED_CTF_ESTIMATE.md
+
+input_config:
+  # Either a single image, a directory + glob, or both
+  image_path: null
+  images_directory: "/path/to/micrographs"
+  images_pattern: "*.mrc"
+
+output_config:
+  output_directory: "/path/to/ctf_estimate_output"
+  allow_file_overwrite: true
+  output_plots: false
+  save_debug_arrays: false
+  optics_csv_filename: "ctf_estimate_optics.csv"
+  metrics_csv_filename: "ctf_estimate_metrics.csv"
+
+computational_config:
+  # Single GPU (0), a list of GPUs, "all", or "cpu" (not mixed)
+  gpu_ids:
+    - 0
+    - 1
+  # null = auto K from free VRAM (GPU) or cores/RAM (CPU); or a positive int
+  images_per_device: null
+  cpu_threads_per_worker: 1
+
+optical_config:
+  pixel_spacing_angstroms: 1.06
+  voltage_kev: 300.0
+  spherical_aberration_mm: 2.7
+  amplitude_contrast_fraction: 0.07
+  # Fitting pixel must be fine enough that the thickness high-res cutoff
+  # (here 4 Å) is inside Nyquist. 1.4 Å → Nyquist 2.8 Å.
+  target_pixel_spacing_angstroms: 1.4
+
+fitting_config:
+  defocus_grid_resolution: [1, 3, 3]
+  frequency_fit_range_angstroms: [30.0, 4.0]
+  defocus_range_microns: [0.0, 5.0]
+  patch_sidelength: 512
+  optimize_astigmatism: true
+  defocus_model: "grid"
+  optimize_phase_shift: false
+  optimize_envelope_1d: false
+  n_iterations_2d: 100
+  refine_steps_1d: 40
+  early_stopping: true
+  early_stopping_patience: 5
+  early_stopping_window_size: 3
+  early_stopping_tolerance: 1.0e-4
+
+# Thickness: 1D grid on tilt-corrected + equiphase spectrum, then Adam on t only.
+# Do not jointly refine defocus with thickness (1d/2d); that pulled both away
+# from CTFFind5 on the no-laser test set.
+thickness_config:
+  refine_dim: "thickness"
+  use_tilt_corrected_ps: true
+  use_equiphase: true
+  frequency_fit_range_angstroms: [30.0, 4.0]
+  thickness_range_angstroms: [300.0, 4000.0]
+  thickness_step_angstroms: 100.0
+  n_iterations: 100
+  defocus_lr: 0.01
+  thickness_lr: 50.0
+  early_stopping: true
+  early_stopping_patience: 5
+  early_stopping_window_size: 3
+  early_stopping_tolerance: 1.0e-4
+
+laser_config: null

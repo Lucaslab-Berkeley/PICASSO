@@ -1,0 +1,66 @@
+# LPP / laser-axis CTF estimation example for PICASSO
+
+input_config:
+  image_path: null
+  images_directory: "/path/to/micrographs"
+  images_pattern: "*.mrc"
+
+output_config:
+  output_directory: "/path/to/ctf_estimate_output"
+  allow_file_overwrite: true
+  output_plots: false
+
+computational_config:
+  # Single GPU (0), a list of GPUs, "all", or "cpu" (not mixed)
+  gpu_ids:
+    - 0
+    - 1
+  images_per_device: null
+  cpu_threads_per_worker: 1
+
+optical_config:
+  pixel_spacing_angstroms: 0.96
+  voltage_kev: 300.0
+  spherical_aberration_mm: 2.7
+  amplitude_contrast_fraction: 0.07
+  target_pixel_spacing_angstroms: 3.0
+
+fitting_config:
+  defocus_grid_resolution: [1, 1, 1]
+  frequency_fit_range_angstroms: [30.0, 4.0]
+  defocus_range_microns: [0.0, 2.0]
+  phase_shift_range_degrees: [50.0, 70.0]
+  patch_sidelength: 256
+  optimize_astigmatism: true
+  defocus_model: "grid"
+  optimize_phase_shift: true
+  phase_shift_model: "quadratic"
+  mask_laser_axis: true
+  laser_axis_mask_width: 0.1
+  n_iterations_2d: 200
+  refine_steps_1d: 100
+  # Plateau early stopping for Adam loops (off by default)
+  early_stopping: false
+  early_stopping_patience: 5
+  early_stopping_window_size: 3
+  early_stopping_tolerance: 1.0e-5
+
+# Thickness-only refine; see RECOMMENDED_CTF_ESTIMATE.md (no-laser tests).
+thickness_config:
+  refine_dim: "thickness"
+  thickness_range_angstroms: [300.0, 4000.0]
+  thickness_step_angstroms: 100.0
+  n_iterations: 100
+  early_stopping: false
+  early_stopping_patience: 5
+  early_stopping_window_size: 3
+  early_stopping_tolerance: 1.0e-5
+
+laser_config:
+  model_laser: true
+  dual_laser: true
+  laser_xy_angle_deg: 0.0
+  NA: 0.055
+  laser_wavelength_angstrom: 10640.0
+  focal_length_angstrom: 6.8e7
+  peak_phase_deg: 45.0
