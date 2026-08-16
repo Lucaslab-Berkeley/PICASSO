@@ -307,11 +307,17 @@ def phase_shift_quadratic_at_positions(
     g: torch.Tensor,
     k: torch.Tensor,
     alpha: torch.Tensor,
+    g2: torch.Tensor | None = None,
+    k2: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Evaluate quadratic phase shift model at normalized positions.
 
-    phase = C + g*s + k*s^2, s = x*cos(alpha) + y*sin(alpha),
-    with x, y in [-1, 1] from positions_norm_xy in [0, 1].
+    Single-axis: phase = C + g*s + k*s^2, s = x*cos(alpha) + y*sin(alpha).
+
+    Two-axis: additionally t = -x*sin(alpha) + y*cos(alpha) and
+    phase += g2*t + k2*t^2.
+
+    x, y in [-1, 1] from positions_norm_xy in [0, 1].
 
     Parameters
     ----------
@@ -319,6 +325,9 @@ def phase_shift_quadratic_at_positions(
         Shape (N, 2) with (x_norm, y_norm) in [0, 1].
     C, g, k, alpha : torch.Tensor
         Scalar parameters (C in degrees, alpha in radians).
+    g2, k2 : torch.Tensor, optional
+        Second-axis linear and quadratic coefficients. When both are provided,
+        the two-axis model is used; when both are None, single-axis only.
 
     Returns
     -------
@@ -327,9 +336,38 @@ def phase_shift_quadratic_at_positions(
     """
     x = 2.0 * positions_norm_xy[..., 0] - 1.0
     y = 2.0 * positions_norm_xy[..., 1] - 1.0
-    s = x * torch.cos(alpha) + y * torch.sin(alpha)
+    ca = torch.cos(alpha)
+    sa = torch.sin(alpha)
+    s = x * ca + y * sa
     phase = C + g * s + k * (s**2)
+    if g2 is not None and k2 is not None:
+        t = -x * sa + y * ca
+        phase = phase + g2 * t + k2 * (t**2)
     return torch.clamp(phase, min=0.0, max=180.0)
+
+
+def phase_shift_quadratic_from_quad_params(
+    positions_norm_xy: torch.Tensor,
+    quad_params: dict[str, torch.nn.Parameter],
+) -> torch.Tensor:
+    """Evaluate phase shift from quad_params dict (single- or two-axis by key set)."""
+    if "g1" in quad_params:
+        return phase_shift_quadratic_at_positions(
+            positions_norm_xy,
+            quad_params["C"],
+            quad_params["g1"],
+            quad_params["k1"],
+            quad_params["alpha"],
+            g2=quad_params["g2"],
+            k2=quad_params["k2"],
+        )
+    return phase_shift_quadratic_at_positions(
+        positions_norm_xy,
+        quad_params["C"],
+        quad_params["g"],
+        quad_params["k"],
+        quad_params["alpha"],
+    )
 
 
 def clamp_phase_shift_quadratic_after_step(
@@ -344,6 +382,15 @@ def quad_params_to_dict(
     quad_params: dict[str, torch.nn.Parameter],
 ) -> dict[str, float]:
     """Convert quadratic phase shift params to a serializable dict (C in degrees, alpha in radians)."""
+    if "g1" in quad_params:
+        return {
+            "C": float(quad_params["C"].detach().cpu().item()),
+            "g1": float(quad_params["g1"].detach().cpu().item()),
+            "k1": float(quad_params["k1"].detach().cpu().item()),
+            "g2": float(quad_params["g2"].detach().cpu().item()),
+            "k2": float(quad_params["k2"].detach().cpu().item()),
+            "alpha": float(quad_params["alpha"].detach().cpu().item()),
+        }
     return {
         "C": float(quad_params["C"].detach().cpu().item()),
         "g": float(quad_params["g"].detach().cpu().item()),
@@ -362,6 +409,9 @@ def initialize_phase_shift_parameters(
     initial_phase_shift_quadratic_g: float = 0.0,
     initial_phase_shift_quadratic_k: float = 0.0,
     initial_phase_shift_quadratic_alpha: float = 0.0,
+    phase_shift_quadratic_two_axes: bool = False,
+    initial_phase_shift_quadratic_g2: float = 0.0,
+    initial_phase_shift_quadratic_k2: float = 0.0,
 ) -> torch.Tensor | dict[str, torch.nn.Parameter]:
     """Initialize phase_shift parameters for a micrograph.
 
@@ -389,12 +439,19 @@ def initialize_phase_shift_parameters(
         Initial k for quadratic mode. Default 0.0.
     initial_phase_shift_quadratic_alpha : float, optional
         Initial alpha (radians) for quadratic mode. Default 0.0.
+    phase_shift_quadratic_two_axes : bool, optional
+        If True, use six-parameter model with g1, k1, g2, k2. Default False.
+    initial_phase_shift_quadratic_g2 : float, optional
+        Initial g2 (t axis) for two-axis quadratic. Default 0.0.
+    initial_phase_shift_quadratic_k2 : float, optional
+        Initial k2 (t axis) for two-axis quadratic. Default 0.0.
 
     Returns
     -------
     torch.Tensor or dict[str, torch.nn.Parameter]
         For per_micrograph/per_particle: phase shift tensor with requires_grad=True.
-        For quadratic: dict with keys "C", "g", "k", "alpha" of nn.Parameter.
+        For quadratic: dict with keys "C", "g", "k", "alpha" or two-axis
+        "C", "g1", "k1", "g2", "k2", "alpha" of nn.Parameter.
     """
     if phase_shift_mode == "quadratic":
         # If C not given, use mean phase shift from results for this micrograph
@@ -414,6 +471,48 @@ def initialize_phase_shift_parameters(
                 initial_C = float(phase_shift_val)
         else:
             initial_C = initial_phase_shift_quadratic_C
+
+        if phase_shift_quadratic_two_axes:
+            return {
+                "C": torch.nn.Parameter(
+                    torch.tensor(initial_C, device=device, dtype=torch.float32)
+                ),
+                "g1": torch.nn.Parameter(
+                    torch.tensor(
+                        initial_phase_shift_quadratic_g,
+                        device=device,
+                        dtype=torch.float32,
+                    )
+                ),
+                "k1": torch.nn.Parameter(
+                    torch.tensor(
+                        initial_phase_shift_quadratic_k,
+                        device=device,
+                        dtype=torch.float32,
+                    )
+                ),
+                "g2": torch.nn.Parameter(
+                    torch.tensor(
+                        initial_phase_shift_quadratic_g2,
+                        device=device,
+                        dtype=torch.float32,
+                    )
+                ),
+                "k2": torch.nn.Parameter(
+                    torch.tensor(
+                        initial_phase_shift_quadratic_k2,
+                        device=device,
+                        dtype=torch.float32,
+                    )
+                ),
+                "alpha": torch.nn.Parameter(
+                    torch.tensor(
+                        initial_phase_shift_quadratic_alpha,
+                        device=device,
+                        dtype=torch.float32,
+                    )
+                ),
+            }
 
         quad_params = {
             "C": torch.nn.Parameter(

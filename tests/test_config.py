@@ -36,6 +36,26 @@ class TestCtfRefineConfig:
         assert config.per_micrograph_iterations == 20
         assert config.convergence_threshold == 0.001
 
+    def test_phase_shift_quadratic_two_axes_requires_quadratic_mode(self):
+        """Two-axis quadratic model is only valid with phase_shift_mode quadratic."""
+        with pytest.raises(ValueError, match="phase_shift_quadratic_two_axes"):
+            CtfRefineConfig(
+                phase_shift_mode="per_micrograph",
+                phase_shift_quadratic_two_axes=True,
+            )
+
+    def test_phase_shift_quadratic_two_axes_with_quadratic_mode(self):
+        """Two-axis flag is allowed when phase_shift_mode is quadratic."""
+        config = CtfRefineConfig(
+            phase_shift_mode="quadratic",
+            phase_shift_quadratic_two_axes=True,
+            phase_shift_quadratic_g2=0.1,
+            phase_shift_quadratic_k2=-0.05,
+        )
+        assert config.phase_shift_quadratic_two_axes is True
+        assert config.phase_shift_quadratic_g2 == 0.1
+        assert config.phase_shift_quadratic_k2 == -0.05
+
 
 class TestOutputConfig:
     """Tests for OutputConfig."""

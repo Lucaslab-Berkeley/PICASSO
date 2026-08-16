@@ -119,6 +119,15 @@ class CTFRefineManager(BaseModelPICASSO):
             "initial_phase_shift_quadratic_alpha": (
                 self.ctf_refine_config.phase_shift_quadratic_alpha
             ),
+            "phase_shift_quadratic_two_axes": (
+                self.ctf_refine_config.phase_shift_quadratic_two_axes
+            ),
+            "initial_phase_shift_quadratic_g2": (
+                self.ctf_refine_config.phase_shift_quadratic_g2
+            ),
+            "initial_phase_shift_quadratic_k2": (
+                self.ctf_refine_config.phase_shift_quadratic_k2
+            ),
         }
 
         return backend_kwargs
@@ -242,21 +251,21 @@ class CTFRefineManager(BaseModelPICASSO):
         if final_initial_phase_shift is None and pkl_params is not None:
             final_initial_phase_shift = pkl_params.get("phase_shift_all")
 
-        # Choose core function based on optimizer type from config
-        if self.ctf_refine_config.optimizer == "lbfgs":
-            core_function = core_refine_ctf_lbfgs
-        else:
-            core_function = core_refine_ctf
-
-        refined_ctf_params = core_function(
+        # Merge kwargs and call the concrete core function (avoids union/Callable
+        # type-checker errors from a single dynamically chosen callable).
+        refine_kwargs: dict[str, Any] = {
             **backend_kwargs,
-            initial_mag_matrix=final_initial_mag_matrix,
-            initial_odd_zernikes=final_initial_odd_zernikes,
-            initial_astigmatism_angle=final_initial_astigmatism_angle,
-            initial_astigmatism_magnitude=final_initial_astigmatism_magnitude,
-            initial_phase_shift=final_initial_phase_shift,
-            output_directory=self.output_config.output_directory,
-        )
+            "initial_mag_matrix": final_initial_mag_matrix,
+            "initial_odd_zernikes": final_initial_odd_zernikes,
+            "initial_astigmatism_angle": final_initial_astigmatism_angle,
+            "initial_astigmatism_magnitude": final_initial_astigmatism_magnitude,
+            "initial_phase_shift": final_initial_phase_shift,
+            "output_directory": self.output_config.output_directory,
+        }
+        if self.ctf_refine_config.optimizer == "lbfgs":
+            refined_ctf_params = core_refine_ctf_lbfgs(**refine_kwargs)
+        else:
+            refined_ctf_params = core_refine_ctf(**refine_kwargs)
 
         # Write loss CSV files if requested
         if (

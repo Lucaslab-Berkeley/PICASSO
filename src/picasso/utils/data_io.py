@@ -334,14 +334,26 @@ def write_refined_ctf_params(
         if "phase_shift_quadratic_params_all" in refined_ctf_params:
             quad_all = refined_ctf_params["phase_shift_quadratic_params_all"]
             f.write("Phase Shift Quadratic (per micrograph):\n")
-            f.write("  C (degrees), g, k, alpha (radians)\n")
+            _first_idx = next(iter(sorted(quad_all.keys())), None)
+            if _first_idx is not None and "g1" in quad_all[_first_idx]:
+                f.write("  C (degrees), g1, k1, g2, k2, alpha (radians)\n")
+            else:
+                f.write("  C (degrees), g, k, alpha (radians)\n")
             for mgraph_idx in sorted(quad_all.keys()):
                 p = quad_all[mgraph_idx]
-                f.write(
-                    f"  Micrograph {mgraph_idx + 1}: "
-                    f"C={p['C']:.6f}, g={p['g']:.6f}, k={p['k']:.6f}, "
-                    f"alpha={p['alpha']:.6f}\n"
-                )
+                if "g1" in p:
+                    f.write(
+                        f"  Micrograph {mgraph_idx + 1}: "
+                        f"C={p['C']:.6f}, g1={p['g1']:.6f}, k1={p['k1']:.6f}, "
+                        f"g2={p['g2']:.6f}, k2={p['k2']:.6f}, "
+                        f"alpha={p['alpha']:.6f}\n"
+                    )
+                else:
+                    f.write(
+                        f"  Micrograph {mgraph_idx + 1}: "
+                        f"C={p['C']:.6f}, g={p['g']:.6f}, k={p['k']:.6f}, "
+                        f"alpha={p['alpha']:.6f}\n"
+                    )
             f.write("\n")
 
 

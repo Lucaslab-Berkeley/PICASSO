@@ -27,7 +27,7 @@ from picasso.core.core_ctf_refine_utils import (
     initialize_defocus_parameters,
     initialize_phase_shift_parameters,
     output_mag_matrix,
-    phase_shift_quadratic_at_positions,
+    phase_shift_quadratic_from_quad_params,
     quad_params_to_dict,
     setup_particle_backend_for_micrograph,
     setup_refinement_parameters,
@@ -77,6 +77,9 @@ def core_refine_ctf(
     initial_phase_shift_quadratic_g: float = 0.0,
     initial_phase_shift_quadratic_k: float = 0.0,
     initial_phase_shift_quadratic_alpha: float = 0.0,
+    phase_shift_quadratic_two_axes: bool = False,
+    initial_phase_shift_quadratic_g2: float = 0.0,
+    initial_phase_shift_quadratic_k2: float = 0.0,
     convergence_threshold: float = 0.0005,
     num_convergence_iterations: int = 5,
     lbfgs_max_eval: int = 5,
@@ -242,6 +245,9 @@ def core_refine_ctf(
             initial_phase_shift_quadratic_g=initial_phase_shift_quadratic_g,
             initial_phase_shift_quadratic_k=initial_phase_shift_quadratic_k,
             initial_phase_shift_quadratic_alpha=initial_phase_shift_quadratic_alpha,
+            phase_shift_quadratic_two_axes=phase_shift_quadratic_two_axes,
+            initial_phase_shift_quadratic_g2=initial_phase_shift_quadratic_g2,
+            initial_phase_shift_quadratic_k2=initial_phase_shift_quadratic_k2,
             setup_state=setup_state,
             log_file=log_file,
         )
@@ -285,6 +291,9 @@ def _dataset_loop(
     initial_phase_shift_quadratic_g: float = 0.0,
     initial_phase_shift_quadratic_k: float = 0.0,
     initial_phase_shift_quadratic_alpha: float = 0.0,
+    phase_shift_quadratic_two_axes: bool = False,
+    initial_phase_shift_quadratic_g2: float = 0.0,
+    initial_phase_shift_quadratic_k2: float = 0.0,
 ) -> dict[str, Any]:
     """Run the outer dataset loop for dataset-level optimization.
 
@@ -382,12 +391,22 @@ def _dataset_loop(
                 )
             else:
                 init_C = 0.0
-            phase_shift_quadratic_params_all[i] = {
-                "C": init_C,
-                "g": initial_phase_shift_quadratic_g,
-                "k": initial_phase_shift_quadratic_k,
-                "alpha": initial_phase_shift_quadratic_alpha,
-            }
+            if phase_shift_quadratic_two_axes:
+                phase_shift_quadratic_params_all[i] = {
+                    "C": init_C,
+                    "g1": initial_phase_shift_quadratic_g,
+                    "k1": initial_phase_shift_quadratic_k,
+                    "g2": initial_phase_shift_quadratic_g2,
+                    "k2": initial_phase_shift_quadratic_k2,
+                    "alpha": initial_phase_shift_quadratic_alpha,
+                }
+            else:
+                phase_shift_quadratic_params_all[i] = {
+                    "C": init_C,
+                    "g": initial_phase_shift_quadratic_g,
+                    "k": initial_phase_shift_quadratic_k,
+                    "alpha": initial_phase_shift_quadratic_alpha,
+                }
 
     loss_history: list[float] = []
     dataset_losses: list[tuple[int, float]] = []
@@ -459,6 +478,9 @@ def _dataset_loop(
             initial_phase_shift_quadratic_g=initial_phase_shift_quadratic_g,
             initial_phase_shift_quadratic_k=initial_phase_shift_quadratic_k,
             initial_phase_shift_quadratic_alpha=initial_phase_shift_quadratic_alpha,
+            phase_shift_quadratic_two_axes=phase_shift_quadratic_two_axes,
+            initial_phase_shift_quadratic_g2=initial_phase_shift_quadratic_g2,
+            initial_phase_shift_quadratic_k2=initial_phase_shift_quadratic_k2,
             setup_state=setup_state,
         )
         if micrograph_loss_init.numel() > 1:
@@ -549,6 +571,9 @@ def _dataset_loop(
                         initial_phase_shift_quadratic_g=initial_phase_shift_quadratic_g,
                         initial_phase_shift_quadratic_k=initial_phase_shift_quadratic_k,
                         initial_phase_shift_quadratic_alpha=initial_phase_shift_quadratic_alpha,
+                        phase_shift_quadratic_two_axes=phase_shift_quadratic_two_axes,
+                        initial_phase_shift_quadratic_g2=initial_phase_shift_quadratic_g2,
+                        initial_phase_shift_quadratic_k2=initial_phase_shift_quadratic_k2,
                         setup_state=local_setup,
                     )
 
@@ -702,6 +727,9 @@ def _dataset_loop(
                     initial_phase_shift_quadratic_g=initial_phase_shift_quadratic_g,
                     initial_phase_shift_quadratic_k=initial_phase_shift_quadratic_k,
                     initial_phase_shift_quadratic_alpha=initial_phase_shift_quadratic_alpha,
+                    phase_shift_quadratic_two_axes=phase_shift_quadratic_two_axes,
+                    initial_phase_shift_quadratic_g2=initial_phase_shift_quadratic_g2,
+                    initial_phase_shift_quadratic_k2=initial_phase_shift_quadratic_k2,
                     setup_state=setup_state,
                 )
 
@@ -836,6 +864,9 @@ def _dataset_loop(
                         initial_phase_shift_quadratic_g=initial_phase_shift_quadratic_g,
                         initial_phase_shift_quadratic_k=initial_phase_shift_quadratic_k,
                         initial_phase_shift_quadratic_alpha=initial_phase_shift_quadratic_alpha,
+                        phase_shift_quadratic_two_axes=phase_shift_quadratic_two_axes,
+                        initial_phase_shift_quadratic_g2=initial_phase_shift_quadratic_g2,
+                        initial_phase_shift_quadratic_k2=initial_phase_shift_quadratic_k2,
                         setup_state=setup_state,
                     )
 
@@ -976,6 +1007,9 @@ def _dataset_loop(
                         initial_phase_shift_quadratic_g=initial_phase_shift_quadratic_g,
                         initial_phase_shift_quadratic_k=initial_phase_shift_quadratic_k,
                         initial_phase_shift_quadratic_alpha=initial_phase_shift_quadratic_alpha,
+                        phase_shift_quadratic_two_axes=phase_shift_quadratic_two_axes,
+                        initial_phase_shift_quadratic_g2=initial_phase_shift_quadratic_g2,
+                        initial_phase_shift_quadratic_k2=initial_phase_shift_quadratic_k2,
                         setup_state=setup_state,
                     )
 
@@ -1186,6 +1220,9 @@ def _dataset_loop(
                             initial_phase_shift_quadratic_g=initial_phase_shift_quadratic_g,
                             initial_phase_shift_quadratic_k=initial_phase_shift_quadratic_k,
                             initial_phase_shift_quadratic_alpha=initial_phase_shift_quadratic_alpha,
+                            phase_shift_quadratic_two_axes=phase_shift_quadratic_two_axes,
+                            initial_phase_shift_quadratic_g2=initial_phase_shift_quadratic_g2,
+                            initial_phase_shift_quadratic_k2=initial_phase_shift_quadratic_k2,
                             setup_state=local_setup,
                         )
 
@@ -1256,6 +1293,9 @@ def _dataset_loop(
                         initial_phase_shift_quadratic_g=initial_phase_shift_quadratic_g,
                         initial_phase_shift_quadratic_k=initial_phase_shift_quadratic_k,
                         initial_phase_shift_quadratic_alpha=initial_phase_shift_quadratic_alpha,
+                        phase_shift_quadratic_two_axes=phase_shift_quadratic_two_axes,
+                        initial_phase_shift_quadratic_g2=initial_phase_shift_quadratic_g2,
+                        initial_phase_shift_quadratic_k2=initial_phase_shift_quadratic_k2,
                         setup_state=setup_state,
                     )
 
@@ -1412,6 +1452,9 @@ def _micrograph_loop(
     initial_phase_shift_quadratic_g: float = 0.0,
     initial_phase_shift_quadratic_k: float = 0.0,
     initial_phase_shift_quadratic_alpha: float = 0.0,
+    phase_shift_quadratic_two_axes: bool = False,
+    initial_phase_shift_quadratic_g2: float = 0.0,
+    initial_phase_shift_quadratic_k2: float = 0.0,
 ) -> tuple[
     torch.Tensor,
     dict[str, Any],
@@ -1617,6 +1660,9 @@ def _micrograph_loop(
             initial_phase_shift_quadratic_g=initial_phase_shift_quadratic_g,
             initial_phase_shift_quadratic_k=initial_phase_shift_quadratic_k,
             initial_phase_shift_quadratic_alpha=initial_phase_shift_quadratic_alpha,
+            phase_shift_quadratic_two_axes=phase_shift_quadratic_two_axes,
+            initial_phase_shift_quadratic_g2=initial_phase_shift_quadratic_g2,
+            initial_phase_shift_quadratic_k2=initial_phase_shift_quadratic_k2,
         )
         if phase_shift_mode == "quadratic" and isinstance(init_result, dict):
             quad_params = init_result
@@ -1692,27 +1738,20 @@ def _micrograph_loop(
         if refine_phase_shift:
             if quad_params is not None and positions_normalized is not None:
                 particle_backend_kwargs["ctf_kwargs"]["phase_shift"] = (
-                    phase_shift_quadratic_at_positions(
+                    phase_shift_quadratic_from_quad_params(
                         positions_normalized,
-                        quad_params["C"],
-                        quad_params["g"],
-                        quad_params["k"],
-                        quad_params["alpha"],
+                        quad_params,
                     )
                 )
             elif phase_shift_tensor is not None:
                 if phase_shift_mode == "per_micrograph":
-                    # Broadcast scalar to all particles
-                    num_particles = (
-                        particle_backend_kwargs["defocus_u"].shape[0]
-                        if isinstance(
-                            particle_backend_kwargs["defocus_u"], torch.Tensor
-                        )
-                        else 1
-                    )
-                    phase_shift_broadcast = phase_shift_tensor.expand(num_particles)
+                    # Pass the scalar directly so the CTF function computes a single
+                    # filter shared across all particles. Expanding to (N,) would cause
+                    # calculate_ctf_2d to treat the N identical values as N independent
+                    # batch dimensions, creating N CTF filters per particle and
+                    # consuming ~N× more GPU memory in the autograd graph.
                     particle_backend_kwargs["ctf_kwargs"]["phase_shift"] = (
-                        phase_shift_broadcast
+                        phase_shift_tensor
                     )
                 else:  # per_particle
                     particle_backend_kwargs["ctf_kwargs"]["phase_shift"] = (
@@ -2079,12 +2118,24 @@ def _micrograph_loop(
         ):
             # Debug: Print initial values
             if quad_params is not None:
-                print(
-                    f"[DEBUG] Micrograph {i + 1} PHASE_SHIFT (quadratic) LBFGS: "
-                    f"Before optimization - C={quad_params['C'].item():.4f}°, "
-                    f"g={quad_params['g'].item():.4f}, k={quad_params['k'].item():.4f}, "
-                    f"alpha={quad_params['alpha'].item():.4f} rad"
-                )
+                if "g1" in quad_params:
+                    print(
+                        f"[DEBUG] Micrograph {i + 1} PHASE_SHIFT (quadratic 2-axis) LBFGS: "
+                        f"Before optimization - C={quad_params['C'].item():.4f}°, "
+                        f"g1={quad_params['g1'].item():.4f}, "
+                        f"k1={quad_params['k1'].item():.4f}, "
+                        f"g2={quad_params['g2'].item():.4f}, "
+                        f"k2={quad_params['k2'].item():.4f}, "
+                        f"alpha={quad_params['alpha'].item():.4f} rad"
+                    )
+                else:
+                    print(
+                        f"[DEBUG] Micrograph {i + 1} PHASE_SHIFT (quadratic) LBFGS: "
+                        f"Before optimization - C={quad_params['C'].item():.4f}°, "
+                        f"g={quad_params['g'].item():.4f}, "
+                        f"k={quad_params['k'].item():.4f}, "
+                        f"alpha={quad_params['alpha'].item():.4f} rad"
+                    )
             elif phase_shift_mode == "per_micrograph":
                 phase_shift_before = (
                     phase_shift_tensor.item()
@@ -2165,30 +2216,20 @@ def _micrograph_loop(
                 if refine_phase_shift:
                     if quad_params is not None and positions_normalized is not None:
                         particle_backend_kwargs["ctf_kwargs"]["phase_shift"] = (  # noqa: F821
-                            phase_shift_quadratic_at_positions(
+                            phase_shift_quadratic_from_quad_params(
                                 positions_normalized,
-                                quad_params["C"],
-                                quad_params["g"],
-                                quad_params["k"],
-                                quad_params["alpha"],
+                                quad_params,
                             )
                         )
                     elif phase_shift_tensor is not None:
                         if phase_shift_mode == "per_micrograph":
-                            # Broadcast scalar to all particles
-                            num_particles = (
-                                particle_backend_kwargs["defocus_u"].shape[0]  # noqa: F821
-                                if isinstance(
-                                    particle_backend_kwargs["defocus_u"],  # noqa: F821
-                                    torch.Tensor,
-                                )
-                                else 1
-                            )
-                            phase_shift_broadcast = phase_shift_tensor.expand(
-                                num_particles
-                            )
+                            # Pass the scalar directly so the CTF function computes a
+                            # single filter shared across all particles. Expanding to
+                            # (N,) causes calculate_ctf_2d to treat the N identical
+                            # values as N independent batch dimensions, creating N CTF
+                            # filters per particle and consuming ~N× more GPU memory.
                             particle_backend_kwargs["ctf_kwargs"]["phase_shift"] = (  # noqa: F821
-                                phase_shift_broadcast
+                                phase_shift_tensor
                             )
                         else:  # per_particle
                             particle_backend_kwargs["ctf_kwargs"]["phase_shift"] = (  # noqa: F821
@@ -2214,12 +2255,26 @@ def _micrograph_loop(
                     else float(loss_scalar)
                 )
                 if quad_params is not None:
-                    print(
-                        f"[DEBUG] PHASE_SHIFT (quadratic) closure call "
-                        f"#{closure_call_count_phase_shift[0]}: loss={loss_val:.6f}, "
-                        f"C={quad_params['C'].item():.4f}°, g={quad_params['g'].item():.4f}, "
-                        f"k={quad_params['k'].item():.4f}, alpha={quad_params['alpha'].item():.4f}"
-                    )
+                    if "g1" in quad_params:
+                        print(
+                            f"[DEBUG] PHASE_SHIFT (quadratic 2-axis) closure call "
+                            f"#{closure_call_count_phase_shift[0]}: loss={loss_val:.6f}, "
+                            f"C={quad_params['C'].item():.4f}°, "
+                            f"g1={quad_params['g1'].item():.4f}, "
+                            f"k1={quad_params['k1'].item():.4f}, "
+                            f"g2={quad_params['g2'].item():.4f}, "
+                            f"k2={quad_params['k2'].item():.4f}, "
+                            f"alpha={quad_params['alpha'].item():.4f}"
+                        )
+                    else:
+                        print(
+                            f"[DEBUG] PHASE_SHIFT (quadratic) closure call "
+                            f"#{closure_call_count_phase_shift[0]}: loss={loss_val:.6f}, "
+                            f"C={quad_params['C'].item():.4f}°, "
+                            f"g={quad_params['g'].item():.4f}, "
+                            f"k={quad_params['k'].item():.4f}, "
+                            f"alpha={quad_params['alpha'].item():.4f}"
+                        )
                 elif phase_shift_mode == "per_micrograph":
                     phase_shift_val = (
                         phase_shift_tensor.item()
@@ -2259,13 +2314,26 @@ def _micrograph_loop(
 
             # Debug: Print final values
             if quad_params is not None:
-                print(
-                    f"[DEBUG] Micrograph {i + 1} PHASE_SHIFT (quadratic) LBFGS: "
-                    f"After optimization - C={quad_params['C'].item():.4f}°, "
-                    f"g={quad_params['g'].item():.4f}, k={quad_params['k'].item():.4f}, "
-                    f"alpha={quad_params['alpha'].item():.4f} rad, "
-                    f"closure_calls={closure_call_count_phase_shift[0]}"
-                )
+                if "g1" in quad_params:
+                    print(
+                        f"[DEBUG] Micrograph {i + 1} PHASE_SHIFT (quadratic 2-axis) LBFGS: "
+                        f"After optimization - C={quad_params['C'].item():.4f}°, "
+                        f"g1={quad_params['g1'].item():.4f}, "
+                        f"k1={quad_params['k1'].item():.4f}, "
+                        f"g2={quad_params['g2'].item():.4f}, "
+                        f"k2={quad_params['k2'].item():.4f}, "
+                        f"alpha={quad_params['alpha'].item():.4f} rad, "
+                        f"closure_calls={closure_call_count_phase_shift[0]}"
+                    )
+                else:
+                    print(
+                        f"[DEBUG] Micrograph {i + 1} PHASE_SHIFT (quadratic) LBFGS: "
+                        f"After optimization - C={quad_params['C'].item():.4f}°, "
+                        f"g={quad_params['g'].item():.4f}, "
+                        f"k={quad_params['k'].item():.4f}, "
+                        f"alpha={quad_params['alpha'].item():.4f} rad, "
+                        f"closure_calls={closure_call_count_phase_shift[0]}"
+                    )
             elif phase_shift_mode == "per_micrograph":
                 phase_shift_after = (
                     phase_shift_tensor.item()
@@ -2356,26 +2424,20 @@ def _micrograph_loop(
         if refine_phase_shift:
             if quad_params is not None and positions_normalized is not None:
                 particle_backend_kwargs["ctf_kwargs"]["phase_shift"] = (
-                    phase_shift_quadratic_at_positions(
+                    phase_shift_quadratic_from_quad_params(
                         positions_normalized,
-                        quad_params["C"],
-                        quad_params["g"],
-                        quad_params["k"],
-                        quad_params["alpha"],
+                        quad_params,
                     )
                 )
             elif phase_shift_tensor is not None:
                 if phase_shift_mode == "per_micrograph":
-                    num_particles = (
-                        particle_backend_kwargs["defocus_u"].shape[0]
-                        if isinstance(
-                            particle_backend_kwargs["defocus_u"], torch.Tensor
-                        )
-                        else 1
-                    )
-                    phase_shift_broadcast = phase_shift_tensor.expand(num_particles)
+                    # Pass the scalar directly so the CTF function computes a single
+                    # filter shared across all particles. Expanding to (N,) would cause
+                    # calculate_ctf_2d to treat the N identical values as N independent
+                    # batch dimensions, creating N CTF filters per particle and
+                    # consuming ~N× more GPU memory in the autograd graph.
                     particle_backend_kwargs["ctf_kwargs"]["phase_shift"] = (
-                        phase_shift_broadcast
+                        phase_shift_tensor
                     )
                 else:  # per_particle
                     particle_backend_kwargs["ctf_kwargs"]["phase_shift"] = (
@@ -2409,12 +2471,9 @@ def _micrograph_loop(
     phase_shift_quadratic_params_result: dict[str, float] | None = None
     if refine_phase_shift:
         if quad_params is not None and positions_normalized is not None:
-            phase_shift_result = phase_shift_quadratic_at_positions(
+            phase_shift_result = phase_shift_quadratic_from_quad_params(
                 positions_normalized,
-                quad_params["C"],
-                quad_params["g"],
-                quad_params["k"],
-                quad_params["alpha"],
+                quad_params,
             ).detach()
             phase_shift_quadratic_params_result = quad_params_to_dict(quad_params)
         elif phase_shift_tensor is not None:

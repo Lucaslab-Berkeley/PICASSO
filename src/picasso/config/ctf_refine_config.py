@@ -29,10 +29,15 @@ class CtfRefineConfig(BaseModelPICASSO):
     defocus_lr: float = 5.0
     phase_shift_lr: float = 1.0
     # Quadratic phase shift model (when phase_shift_mode == "quadratic")
-    phase_shift_quadratic_C: float | None = None  # degrees; if None, use mean from results
+    # degrees; if None, use mean from results
+    phase_shift_quadratic_C: float | None = None
     phase_shift_quadratic_g: float = 0.0
     phase_shift_quadratic_k: float = 0.0
     phase_shift_quadratic_alpha: float = 0.0  # radians
+    # Two-axis: C + g1*s + k1*s^2 + g2*t + k2*t^2 (needs quadratic mode)
+    phase_shift_quadratic_two_axes: bool = False
+    phase_shift_quadratic_g2: float = 0.0
+    phase_shift_quadratic_k2: float = 0.0
 
     @model_validator(mode="after")  # type: ignore
     def validate_optimizer(self) -> Self:
@@ -74,5 +79,16 @@ class CtfRefineConfig(BaseModelPICASSO):
             raise ValueError(
                 "phase_shift_mode must be 'per_micrograph', 'per_particle', or "
                 f"'quadratic', got '{self.phase_shift_mode}'"
+            )
+        return self
+
+    @model_validator(mode="after")  # type: ignore
+    def validate_phase_shift_quadratic_two_axes(self) -> Self:
+        """Require quadratic mode when two-axis phase model is enabled."""
+        if self.phase_shift_quadratic_two_axes and self.phase_shift_mode != "quadratic":
+            raise ValueError(
+                "phase_shift_quadratic_two_axes requires "
+                "phase_shift_mode == 'quadratic', "
+                f"got phase_shift_mode='{self.phase_shift_mode}'"
             )
         return self
