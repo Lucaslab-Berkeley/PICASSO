@@ -2,7 +2,7 @@
 # Maps to Leopard-EM OpticsGroup (defocus in Å) plus a metrics table.
 # Recommended route for untilted 300 kV movies: 1D → 2D defocus, then
 # 1D thickness grid + thickness-only Adam. See
-# test_datasets/no-laser/PICASSO_results/RECOMMENDED_CTF_ESTIMATE.md
+# programs/ctf_estimation/RECOMMENDED_CTF_ESTIMATE.md
 
 input_config:
   # Either a single image, a directory + glob, or both

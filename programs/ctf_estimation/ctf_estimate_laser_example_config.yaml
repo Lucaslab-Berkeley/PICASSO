@@ -45,7 +45,7 @@ fitting_config:
   early_stopping_window_size: 3
   early_stopping_tolerance: 1.0e-5
 
-# Thickness-only refine; see RECOMMENDED_CTF_ESTIMATE.md (no-laser tests).
+# Thickness-only refine; see programs/ctf_estimation/RECOMMENDED_CTF_ESTIMATE.md
 thickness_config:
   refine_dim: "thickness"
   thickness_range_angstroms: [300.0, 4000.0]
