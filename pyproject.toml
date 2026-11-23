@@ -45,9 +45,11 @@ dependencies = [
     "pyyaml",
     "types-PyYAML",
     "leopard-em",
+    "roma",
     "torch-ctf",
     "torch-ctf-estimation",
     "torch-grid-utils",
+    "torch-fourier-slice",
     "tqdm",
     "matplotlib",
 ]
