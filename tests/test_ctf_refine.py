@@ -425,3 +425,59 @@ def test_loss_matches_leopard_em():
     torch.testing.assert_close(z_new, z_ref, rtol=1e-4, atol=1e-3)
     for key, grad in g_ref.items():
         torch.testing.assert_close(g_new[key], grad, rtol=1e-3, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Non-finite gradients (Zernike terms + trainable magnification matrix)
+# ---------------------------------------------------------------------------
+
+
+def _mag_gradient(zernikes: dict[str, Any]) -> torch.Tensor:
+    torch.set_grad_enabled(True)
+    kwargs = _synthetic_backend_kwargs(32, 4, torch.device("cpu"))
+    mag = torch.tensor([[1.002, 0.001], [0.0005, 0.998]], requires_grad=True)
+    kwargs["mag_matrix"] = mag
+    kwargs["ctf_kwargs"] = dict(kwargs["ctf_kwargs"], mag_matrix=mag, **zernikes)
+    compute_particle_z_scores(kwargs, batch_size=4).mean().backward()
+    assert mag.grad is not None
+    return mag.grad
+
+
+def test_mag_gradient_finite_with_zero_zernike_dicts():
+    """Leopard-EM results CSVs carry all-zero Zernike dicts."""
+    zero = torch.tensor(0.0)
+    grad = _mag_gradient(
+        {
+            "even_zernikes": {"Z44c": zero, "Z44s": zero, "Z60": zero},
+            "odd_zernikes": {"Z31c": zero, "Z31s": zero, "Z33c": zero, "Z33s": zero},
+        }
+    )
+    assert torch.isfinite(grad).all()
+
+
+def test_mag_gradient_finite_with_active_beam_tilt():
+    """Needs torch-grid-utils with the atan2-at-origin fix on older PyTorch."""
+    coeff = torch.tensor(50.0, requires_grad=True)
+    grad = _mag_gradient({"odd_zernikes": {"Z31c": coeff, "Z31s": torch.tensor(-20.0)}})
+    assert torch.isfinite(grad).all()
+
+
+def test_inactive_zernike_dict_detection():
+    from picasso.core.core_ctf_refine_loss import _is_inactive_zernike_dict
+
+    assert _is_inactive_zernike_dict({"Z31c": torch.tensor(0.0), "Z31s": 0.0})
+    assert not _is_inactive_zernike_dict({"Z31c": torch.tensor(1.0)})
+    assert not _is_inactive_zernike_dict(
+        {"Z31c": torch.tensor(0.0, requires_grad=True)}
+    )
+    assert not _is_inactive_zernike_dict(None)
+    assert not _is_inactive_zernike_dict({})
+
+
+def test_non_finite_loss_stops_refinement(synthetic, monkeypatch):
+    def nan_loss(pbk: dict[str, Any], batch_size: int) -> torch.Tensor:
+        return synthetic.loss(pbk, batch_size) * torch.tensor(float("nan"))
+
+    monkeypatch.setattr(driver, "compute_micrograph_loss", nan_loss)
+    with pytest.raises(FloatingPointError, match="Non-finite loss in micrograph 1"):
+        run(refine_astigmatism=True)

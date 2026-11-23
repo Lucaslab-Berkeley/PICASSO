@@ -64,6 +64,19 @@ def _make_rfft_hermitian(spectrum: torch.Tensor, full_width: int) -> torch.Tenso
     return torch.cat([dc_column, spectrum[..., 1:]], dim=-1)
 
 
+def _is_inactive_zernike_dict(zernikes: Any) -> bool:
+    """True for a Zernike dict whose coefficients are all zero and not trainable."""
+    if not isinstance(zernikes, dict) or not zernikes:
+        return False
+    for value in zernikes.values():
+        if isinstance(value, torch.Tensor):
+            if value.requires_grad or bool((value != 0).any()):
+                return False
+        elif value != 0:
+            return False
+    return True
+
+
 def _get_static_cache(
     particle_backend_kwargs: dict[str, Any],
     device: torch.device,
@@ -187,6 +200,11 @@ def compute_particle_z_scores(
         mag_matrix = mag_matrix.to(device=device, dtype=torch.float32)
 
     ctf_kwargs = move_ctf_kwargs_tensors_to_device(kwargs["ctf_kwargs"], device)
+    for key in ("even_zernikes", "odd_zernikes"):
+        if _is_inactive_zernike_dict(ctf_kwargs.get(key)):
+            # All-zero, non-trainable coefficients add nothing to the CTF but
+            # still route gradients through the polar angle of the frequency grid.
+            ctf_kwargs[key] = None
     phase_shift = ctf_kwargs.get("phase_shift", 0.0)
     per_particle_phase = (
         isinstance(phase_shift, torch.Tensor)

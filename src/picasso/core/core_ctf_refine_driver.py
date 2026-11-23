@@ -108,6 +108,32 @@ class MicrographState:
     quad_params: dict[str, float] | None = None
 
 
+def _raise_if_nonfinite(
+    loss: torch.Tensor | float,
+    params: list[torch.Tensor],
+    context: str,
+) -> None:
+    """Stop with a clear error instead of letting an optimizer step on NaN/inf.
+
+    L-BFGS does not fail on non-finite values; it silently stalls or produces
+    garbage parameters.
+    """
+    loss_ok = bool(torch.isfinite(torch.as_tensor(loss)).all())
+    bad = [
+        index
+        for index, param in enumerate(params)
+        if param.grad is not None and not bool(torch.isfinite(param.grad).all())
+    ]
+    if loss_ok and not bad:
+        return
+    problem = "loss" if not loss_ok else f"gradient of parameter(s) {bad}"
+    raise FloatingPointError(
+        f"Non-finite {problem} in {context}. If the anisotropic magnification is "
+        "refined, check that torch-grid-utils includes the fix for the atan2 "
+        "gradient at the origin (NaN on older PyTorch releases)."
+    )
+
+
 def _log_message(message: str, log_file: Any = None) -> None:
     """Write message to the console and, if given, to the log file."""
     print(message)
@@ -394,6 +420,7 @@ def _micrograph_loop(
                             clear_grads()
                             loss = micrograph_loss()
                             loss.backward()
+                            _raise_if_nonfinite(loss, all_params, f"micrograph {i + 1}")
                             return loss.detach()
 
                         step_loss = float(optimizer.step(closure))  # type: ignore[arg-type]
@@ -406,6 +433,7 @@ def _micrograph_loop(
                     clear_grads()
                     loss = micrograph_loss()
                     loss.backward()
+                    _raise_if_nonfinite(loss, all_params, f"micrograph {i + 1}")
                     start_loss = float(loss.detach())
                     for optimizer in optimizers.values():
                         optimizer.step()
@@ -712,7 +740,13 @@ def run_ctf_refinement(
                     refine_anisotropic_mag=opts.refine_anisotropic_mag,
                     refine_beam_tilt=opts.refine_beam_tilt,
                 )
-            return sum(value for value, _ in results.values()) / num_micrographs
+            avg_loss = sum(value for value, _ in results.values()) / num_micrographs
+            _raise_if_nonfinite(
+                avg_loss,
+                [anistropic_mag, *odd_zernikes.values()],
+                "the dataset-level gradient (anisotropic magnification / beam tilt)",
+            )
+            return avg_loss
 
         def zero_dataset_grads() -> None:
             for optimizer in dataset_optimizers:
