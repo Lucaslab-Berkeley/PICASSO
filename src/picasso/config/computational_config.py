@@ -3,7 +3,8 @@
 from typing import Annotated
 
 import torch
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+from typing_extensions import Self
 
 # Type alias for non-negative integer
 NonNegativeInt = Annotated[int, Field(ge=0)]
@@ -31,6 +32,18 @@ class ComputationalConfig(BaseModel):
 
     # Support single value, list, "all", or "cpu"
     gpu_ids: str | NonNegativeInt | list[str | NonNegativeInt] | None = Field(default=0)
+    images_per_device: int | None = Field(
+        default=None,
+        description=(
+            "Concurrent images per device. None = choose from free VRAM (GPU) "
+            "or cores/RAM (CPU). A positive int forces that concurrency."
+        ),
+    )
+    cpu_threads_per_worker: int = Field(
+        default=1,
+        ge=1,
+        description="BLAS/PyTorch threads per CPU process worker.",
+    )
 
     @field_validator("gpu_ids")  # type: ignore[misc]
     @classmethod
@@ -114,6 +127,29 @@ class ComputationalConfig(BaseModel):
         raise ValueError(
             f"Invalid type for gpu_ids: {type(v)}. Expected int, str, list, or None."
         )
+
+    @field_validator("images_per_device")  # type: ignore[misc]
+    @classmethod
+    def validate_images_per_device(cls, v: int | None) -> int | None:
+        """Require a positive concurrency when the field is set."""
+        if v is not None and v < 1:
+            raise ValueError("images_per_device must be >= 1 when set.")
+        return v
+
+    @model_validator(mode="after")  # type: ignore[misc]
+    def reject_mixed_cpu_gpu(self) -> Self:
+        """Estimation/refine runs are GPU-only or cpu, not mixed."""
+        gpu_ids = self.gpu_ids
+        if not isinstance(gpu_ids, list):
+            return self
+        has_cpu = any(item == "cpu" for item in gpu_ids)
+        has_gpu = any(item != "cpu" for item in gpu_ids)
+        if has_cpu and has_gpu:
+            raise ValueError(
+                "gpu_ids cannot mix CPU and GPU devices. "
+                "Use gpu_ids: cpu, or a list of GPU ids only."
+            )
+        return self
 
     @property
     def gpu_device(self) -> torch.device:

@@ -46,7 +46,10 @@ dependencies = [
     "types-PyYAML",
     "leopard-em",
     "torch-ctf",
-    "torch-grid-utils"
+    "torch-ctf-estimation",
+    "torch-grid-utils",
+    "tqdm",
+    "matplotlib",
 ]
 
 # https://peps.python.org/pep-0621/#dependencies-optional-dependencies
@@ -86,6 +89,7 @@ dev = [
 PICASSO = { workspace = true }
 leopard-em = { path = "/home/jdickerson/git/LucasLab/Leopard-EM", editable = true }
 torch-ctf = { path = "/home/jdickerson/git/teamtomo/torch-ctf", editable = true }
+torch-ctf-estimation = { path = "/home/jdickerson/git/teamtomo/torch-ctf-estimation", editable = true }
 torch-grid-utils = { path = "/home/jdickerson/git/teamtomo/torch-grid-utils", editable = true }
 torch-fourier-slice = { path = "/home/jdickerson/git/teamtomo/torch-fourier-slice", editable = true }
 

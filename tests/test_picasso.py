@@ -16,16 +16,27 @@ def test_import_core():
     assert callable(core_refine_ctf)
 
 
+def test_import_core_estimate():
+    """Test that the CTF estimation core function can be imported."""
+    from picasso.core import core_estimate_ctf
+
+    assert callable(core_estimate_ctf)
+
+
 def test_import_config():
     """Test that config modules can be imported."""
     from picasso.config import (
         ComputationalConfig,
+        CtfEstimateInputConfig,
+        CtfEstimateOutputConfig,
         CtfRefineConfig,
         InputConfig,
         OutputConfig,
     )
 
     assert CtfRefineConfig is not None
+    assert CtfEstimateInputConfig is not None
+    assert CtfEstimateOutputConfig is not None
     assert OutputConfig is not None
     assert ComputationalConfig is not None
     assert InputConfig is not None
