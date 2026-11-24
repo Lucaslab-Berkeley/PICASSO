@@ -20,6 +20,7 @@ All loss evaluations read the per-micrograph parameters from a single
 # pylint: disable=too-many-lines,too-many-arguments,too-many-locals
 # pylint: disable=too-many-branches,too-many-statements,too-many-positional-arguments
 
+import math
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -42,6 +43,7 @@ from picasso.core.core_ctf_refine_utils import (
     balance_micrographs_across_gpus,
     check_convergence,
     clamp_phase_shift_quadratic_after_step,
+    common_results_mag_matrix,
     compute_micrograph_loss,
     count_particles,
     create_final_results_dict,
@@ -56,6 +58,8 @@ from picasso.core.core_ctf_refine_utils import (
 )
 
 ZERNIKE_SCALE = 1e6
+# Smallest starting astigmatism (Å, defocus_u - defocus_v); see _micrograph_loop.
+MIN_START_ASTIGMATISM = 1.0
 T = TypeVar("T")
 
 
@@ -305,32 +309,58 @@ def _micrograph_loop(
     lbfgs_lrs: dict[str, float] = {}
 
     # --- astigmatism (per micrograph) ------------------------------------------
-    magnitude_scale = 1.0
+    # Refined as Cartesian components in Å, a = m * (cos 2θ, sin 2θ), with
+    # m = defocus_u - defocus_v and θ the astigmatism angle. Unlike (θ, m) this is
+    # well conditioned for small astigmatism (where θ is nearly undefined), m can
+    # never turn negative, and one learning rate in Å fits both components.
     if opts.refine_astigmatism:
-        start_angle = (
-            state.astigmatism_angle
-            if state.astigmatism_angle is not None
-            else csv_angle[0]
+        start_angle = float(
+            _as_scalar_tensor(
+                state.astigmatism_angle
+                if state.astigmatism_angle is not None
+                else csv_angle[0],
+                device,
+            )
         )
-        start_magnitude = (
-            state.astigmatism_magnitude
-            if state.astigmatism_magnitude is not None
-            else (csv_du - csv_dv).mean()
+        # Leopard-EM's CTF uses |defocus_u - defocus_v|, so a negative magnitude
+        # is the same CTF as its absolute value at the same angle.
+        start_magnitude = abs(
+            float(
+                _as_scalar_tensor(
+                    state.astigmatism_magnitude
+                    if state.astigmatism_magnitude is not None
+                    else (csv_du - csv_dv).mean(),
+                    device,
+                )
+            )
         )
-        if opts.optimizer_type == "lbfgs":
-            # L-BFGS has a single lr; rescale the magnitude so the configured
-            # angle/magnitude lr ratio still applies.
-            magnitude_scale = opts.astigmatism_magnitude_lr / opts.astigmatism_angle_lr
-        astig_angle = _as_scalar_tensor(start_angle, device).requires_grad_(trainable)
-        astig_mag_scaled = (
-            _as_scalar_tensor(start_magnitude, device) / magnitude_scale
+        # The CTF only takes (u, v, θ), so the gradient vanishes at exactly zero
+        # astigmatism; start from at least MIN_START_ASTIGMATISM instead.
+        start_magnitude = max(start_magnitude, MIN_START_ASTIGMATISM)
+        two_theta = math.radians(2.0 * start_angle)
+        astig_xy = torch.tensor(
+            [
+                start_magnitude * math.cos(two_theta),
+                start_magnitude * math.sin(two_theta),
+            ],
+            device=device,
         ).requires_grad_(trainable)
         defocus_mean = (csv_du + csv_dv) / 2.0
         groups["astigmatism"] = [
-            {"params": [astig_angle], "lr": opts.astigmatism_angle_lr},
-            {"params": [astig_mag_scaled], "lr": opts.astigmatism_magnitude_lr},
+            {"params": [astig_xy], "lr": opts.astigmatism_magnitude_lr}
         ]
-        lbfgs_lrs["astigmatism"] = opts.astigmatism_angle_lr
+        lbfgs_lrs["astigmatism"] = opts.astigmatism_magnitude_lr
+
+    def astigmatism_polar() -> tuple[torch.Tensor, torch.Tensor]:
+        """Magnitude (defocus_u - defocus_v, Å) and angle (deg) from astig_xy."""
+        a_cos, a_sin = astig_xy[0], astig_xy[1]
+        magnitude = torch.sqrt(a_cos**2 + a_sin**2 + 1e-12)
+        at_origin = (a_cos == 0) & (a_sin == 0)
+        safe_cos = torch.where(at_origin, torch.ones_like(a_cos), a_cos)
+        two_theta = torch.where(
+            at_origin, torch.zeros_like(a_cos), torch.atan2(a_sin, safe_cos)
+        )
+        return magnitude, torch.rad2deg(two_theta) / 2.0
 
     # --- per-particle defocus offsets ------------------------------------------
     if opts.refine_defocus:
@@ -390,10 +420,10 @@ def _micrograph_loop(
 
     def apply_parameters() -> None:
         if opts.refine_astigmatism:
-            magnitude = astig_mag_scaled * magnitude_scale
+            magnitude, angle_deg = astigmatism_polar()
             defocus_u = defocus_mean + magnitude / 2.0
             defocus_v = defocus_mean - magnitude / 2.0
-            angle = astig_angle.expand(num_particles)
+            angle = angle_deg.expand(num_particles)
         else:
             defocus_u, defocus_v, angle = csv_du, csv_dv, csv_angle
         if opts.refine_defocus:
@@ -495,8 +525,14 @@ def _micrograph_loop(
 
     with torch.no_grad():
         if opts.refine_astigmatism:
-            out_angle = astig_angle.detach().clone()
-            out_magnitude = (astig_mag_scaled * magnitude_scale).detach().clone()
+            magnitude, angle_deg = astigmatism_polar()
+            # θ and θ + 180° are the same astigmatism; report the angle within
+            # ±90° of the starting angle so it stays comparable to the input.
+            angle_deg = angle_deg + 180.0 * torch.round(
+                (start_angle - angle_deg) / 180.0
+            )
+            out_angle = angle_deg.detach().clone()
+            out_magnitude = magnitude.detach().clone()
         else:
             out_angle = csv_angle[0].detach().clone()
             out_magnitude = (csv_du - csv_dv).mean().detach().clone()
@@ -647,6 +683,25 @@ def run_ctf_refinement(
                 f"{name} must have shape ({num_micrographs},), got {tuple(value.shape)}"
             )
 
+    # Without an explicit starting matrix, start from (and, when not refining,
+    # report) the matrix already in the results CSVs, e.g. from an earlier run.
+    mag_note = None
+    if initial_mag_matrix is None:
+        csv_mag, consistent = common_results_mag_matrix(results_files)
+        if csv_mag is not None:
+            initial_mag_matrix = csv_mag
+            mag_note = (
+                "Magnification matrix from the results CSVs: "
+                f"{csv_mag.numpy().round(6).tolist()}"
+            )
+        elif not consistent:
+            mag_note = "The results CSVs have different magnification matrices" + (
+                "; refinement starts from the identity and its result replaces "
+                "all of them."
+                if opts.refine_anisotropic_mag
+                else "; each micrograph uses its own."
+            )
+
     setup_state = setup_refinement_parameters(
         results_files=results_files,
         device=primary_device,
@@ -681,6 +736,8 @@ def run_ctf_refinement(
         gpu_assignments = balance_micrographs_across_gpus(
             [count_particles(path) for path in results_files], num_gpus
         )
+        if mag_note is not None:
+            _log_message(mag_note, log_file)
         _log_message(f"\nUsing {num_gpus} device(s):", log_file)
         for gpu_id, indices in enumerate(gpu_assignments):
             particles = sum(count_particles(results_files[i]) for i in indices)
@@ -1167,7 +1224,9 @@ def refine_ctf(
     anisotropic_mag_lr, beam_tilt_lr : float
         Learning rates of the dataset-level optimizers.
     astigmatism_angle_lr, astigmatism_magnitude_lr : float
-        Learning rates for astigmatism.
+        Astigmatism is refined as two Cartesian components in Å, both with
+        ``astigmatism_magnitude_lr``; ``astigmatism_angle_lr`` is unused (kept so
+        existing configs still load).
     defocus_lr, phase_shift_lr : float
         Learning rates for defocus and phase shift.
     output_directory : str | Path | None

@@ -28,6 +28,23 @@ def read_mrc_to_numpy(mrc_path: str | os.PathLike | Path) -> np.ndarray:
         return mrc.data.copy()
 
 
+def read_mrc_image_shape(mrc_path: str | os.PathLike | Path) -> tuple[int, int]:
+    """(height, width) of an MRC image, read from the header only.
+
+    Parameters
+    ----------
+    mrc_path : str | os.PathLike | Path
+        Path to the MRC file.
+
+    Returns
+    -------
+    tuple[int, int]
+        Number of rows (ny) and columns (nx).
+    """
+    with mrcfile.open(mrc_path, header_only=True, permissive=True) as mrc:
+        return int(mrc.header.ny), int(mrc.header.nx)
+
+
 def read_mrc_to_tensor(mrc_path: str | os.PathLike | Path) -> torch.Tensor:
     """Reads an MRC file and returns the data as a torch tensor.
 

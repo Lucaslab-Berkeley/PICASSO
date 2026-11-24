@@ -12,7 +12,7 @@ from leopard_em.pydantic_models.data_structures import ParticleStack
 from leopard_em.utils.backend_setup import setup_particle_backend_kwargs
 
 from picasso.core.core_ctf_refine_loss import compute_particle_z_scores
-from picasso.utils.data_io import read_mrc_to_numpy
+from picasso.utils.data_io import read_mrc_image_shape
 
 
 def output_mag_matrix(mag_matrix: torch.Tensor) -> None:
@@ -59,8 +59,8 @@ def get_particle_positions_normalized(
 ) -> torch.Tensor:
     """Get normalized (x_norm, y_norm) positions in [0, 1] for quadratic phase shift.
 
-    Reads the results CSV, gets micrograph_path from the first row, loads the
-    micrograph MRC to obtain image dimensions, and normalizes pos_x_img and
+    Reads the results CSV, gets micrograph_path from the first row, reads the
+    image dimensions from the micrograph's MRC header, and normalizes pos_x_img and
     pos_y_img columns.
 
     Parameters
@@ -87,12 +87,7 @@ def get_particle_positions_normalized(
             "columns for quadratic phase shift mode."
         )
     micrograph_path = df["micrograph_path"].iloc[0]
-    micrograph = read_mrc_to_numpy(micrograph_path)
-    # MRC shape: (nz, ny, nx) for 3D or (ny, nx) for 2D
-    if micrograph.ndim == 3:
-        height, width = int(micrograph.shape[1]), int(micrograph.shape[2])
-    else:
-        height, width = int(micrograph.shape[0]), int(micrograph.shape[1])
+    height, width = read_mrc_image_shape(micrograph_path)
     pos_x = torch.tensor(
         df["pos_x_img"].values.astype(np.float32), device=device, dtype=torch.float32
     )
@@ -564,6 +559,63 @@ def distribute_micrographs_across_gpus(
     for idx, mic_idx in enumerate(range(num_micrographs)):
         gpu_assignments[idx % num_gpus].append(mic_idx)
     return gpu_assignments
+
+
+def read_results_mag_matrix(results_path: str) -> torch.Tensor | None:
+    """Magnification matrix in a results CSV (first row), or None if absent.
+
+    Parameters
+    ----------
+    results_path : str
+        Path to a results CSV with an optional ``mag_matrix`` column holding
+        ``"[a, b, c, d]"``.
+
+    Returns
+    -------
+    torch.Tensor | None
+        The 2x2 matrix, or None if the column is missing, empty or unreadable.
+    """
+    try:
+        value = pd.read_csv(results_path, usecols=["mag_matrix"], nrows=1)[
+            "mag_matrix"
+        ].iloc[0]
+        numbers = [float(x) for x in str(value).strip("[] ").split(",")]
+    except (OSError, ValueError, KeyError, IndexError):
+        return None
+    if len(numbers) != 4 or not all(math.isfinite(x) for x in numbers):
+        return None
+    return torch.tensor(numbers, dtype=torch.float32).reshape(2, 2)
+
+
+def common_results_mag_matrix(
+    results_files: list[str],
+) -> tuple[torch.Tensor | None, bool]:
+    """The magnification matrix shared by all results CSVs.
+
+    A missing matrix counts as the identity (no transform), as in Leopard-EM.
+
+    Parameters
+    ----------
+    results_files : list[str]
+        Results CSV paths.
+
+    Returns
+    -------
+    tuple[torch.Tensor | None, bool]
+        The shared matrix (None if every CSV has none or the identity) and
+        whether all CSVs agree.
+    """
+    identity = torch.eye(2)
+    matrices = []
+    for path in results_files:
+        matrix = read_results_mag_matrix(path)
+        matrices.append(identity if matrix is None else matrix)
+    if not matrices:
+        return None, True
+    first = matrices[0]
+    if not all(torch.allclose(m, first, rtol=0, atol=1e-7) for m in matrices[1:]):
+        return None, False
+    return (None if torch.equal(first, identity) else first), True
 
 
 def balance_micrographs_across_gpus(

@@ -24,6 +24,8 @@ class CtfRefineConfig(BaseModelPICASSO):
     lbfgs_max_eval: int = 5
     anisotropic_mag_lr: float = 0.005
     beam_tilt_lr: float = 0.01
+    # Unused: astigmatism is refined as two Cartesian components in Å, both with
+    # astigmatism_magnitude_lr. Kept so existing configs still load.
     astigmatism_angle_lr: float = 5.0
     astigmatism_magnitude_lr: float = 5.0
     defocus_lr: float = 5.0

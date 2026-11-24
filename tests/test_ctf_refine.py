@@ -5,6 +5,7 @@ synthetic loss so the control flow can be checked on the CPU.
 """
 
 import json
+import sys
 from typing import Any
 
 import pandas as pd
@@ -69,7 +70,12 @@ class SyntheticProblem:
         return (
             ((mean_df - true_mean) / 100.0) ** 2
             + ((magnitude - TRUE_MAG) / 100.0) ** 2
-            + ((pbk["defocus_angle"] - TRUE_ANGLE) / 10.0) ** 2
+            # Astigmatism angles are periodic in 180 degrees, as in a real CTF.
+            + (
+                (torch.remainder(pbk["defocus_angle"] - TRUE_ANGLE + 90, 180) - 90)
+                / 10.0
+            )
+            ** 2
             + ((phase - TRUE_PHASE) / 10.0) ** 2
             + 1e4 * ((pbk["mag_matrix"] - self.target_mag) ** 2).sum()
             - 10.0
@@ -709,3 +715,91 @@ def test_balance_micrographs_across_gpus():
     assignments = balance_micrographs_across_gpus([400, 50, 50, 50, 50, 50], 2)
     assert assignments == [[0], [1, 2, 3, 4, 5]]  # 400 vs 250 particles
     assert balance_micrographs_across_gpus([5, 5], 1) == [[0, 1]]
+
+
+# ---------------------------------------------------------------------------
+# Cartesian astigmatism; magnification matrix from the results CSVs
+# ---------------------------------------------------------------------------
+
+
+def _set_synthetic_astigmatism(monkeypatch, du, dv, angle, true_mag, true_angle):
+    module = sys.modules[__name__]
+    for name, value in {
+        "CSV_DU": du,
+        "CSV_DV": dv,
+        "CSV_ANGLE": angle,
+        "TRUE_MAG": true_mag,
+        "TRUE_ANGLE": true_angle,
+    }.items():
+        monkeypatch.setattr(module, name, value)
+
+
+def test_astigmatism_angle_reported_near_start(synthetic, monkeypatch):
+    """170 deg -> 175 deg must not come back as -5 deg (same astigmatism)."""
+    _set_synthetic_astigmatism(monkeypatch, 12100.0, 11700.0, 170.0, 450.0, 175.0)
+    result = run(refine_astigmatism=True, per_micrograph_iterations=10)
+    torch.testing.assert_close(
+        result["astigmatism_angle"], torch.full((2,), 175.0), atol=0.1, rtol=0
+    )
+    torch.testing.assert_close(
+        result["astigmatism_magnitude"], torch.full((2,), 450.0), atol=1.0, rtol=0
+    )
+
+
+def test_astigmatism_refines_from_zero(synthetic, monkeypatch):
+    """A micrograph with defocus_u == defocus_v can still gain astigmatism."""
+    _set_synthetic_astigmatism(monkeypatch, 11900.0, 11900.0, 0.0, 300.0, 20.0)
+    result = run(refine_astigmatism=True, per_micrograph_iterations=10)
+    torch.testing.assert_close(
+        result["astigmatism_magnitude"], torch.full((2,), 300.0), atol=1.0, rtol=0
+    )
+    torch.testing.assert_close(
+        result["astigmatism_angle"], torch.full((2,), 20.0), atol=0.1, rtol=0
+    )
+
+
+def _write_results_csv(path, mag_matrix: str | None) -> str:
+    frame = {"defocus_u": [1.0, 1.0]}
+    if mag_matrix is not None:
+        frame["mag_matrix"] = [mag_matrix, mag_matrix]
+    pd.DataFrame(frame).to_csv(path, index=False)
+    return str(path)
+
+
+def test_read_results_mag_matrix(tmp_path):
+    from picasso.core.core_ctf_refine_utils import (
+        common_results_mag_matrix,
+        read_results_mag_matrix,
+    )
+
+    a = _write_results_csv(tmp_path / "a.csv", "[1.01, 0.002, 0.001, 0.99]")
+    b = _write_results_csv(tmp_path / "b.csv", "[1.01, 0.002, 0.001, 0.99]")
+    c = _write_results_csv(tmp_path / "c.csv", "[1.0, 0.0, 0.0, 1.0]")
+    empty = _write_results_csv(tmp_path / "d.csv", "")
+    missing = _write_results_csv(tmp_path / "e.csv", None)
+
+    expected = torch.tensor([[1.01, 0.002], [0.001, 0.99]])
+    torch.testing.assert_close(read_results_mag_matrix(a), expected)
+    assert read_results_mag_matrix(empty) is None
+    assert read_results_mag_matrix(missing) is None
+    assert read_results_mag_matrix(str(tmp_path / "nope.csv")) is None
+
+    matrix, consistent = common_results_mag_matrix([a, b])
+    assert consistent
+    torch.testing.assert_close(matrix, expected)
+    assert common_results_mag_matrix([a, c]) == (None, False)
+    assert common_results_mag_matrix([c, empty, missing]) == (None, True)
+
+
+@pytest.mark.parametrize("refine", [False, True])
+def test_mag_matrix_starts_from_results_csv(synthetic, tmp_path, refine):
+    csv_matrix = "[1.01, 0.0, 0.0, 0.99]"
+    files = [
+        _write_results_csv(tmp_path / f"m{k}_results.csv", csv_matrix) for k in (0, 1)
+    ]
+    synthetic.target_mag = torch.tensor([[1.01, 0.0], [0.0, 0.99]])
+    result = run(results_files=files, refine_anisotropic_mag=refine)
+    # Reported (not refined) or kept (already optimal) rather than identity.
+    torch.testing.assert_close(
+        result["anistropic_mag"], synthetic.target_mag, atol=1e-6, rtol=0
+    )
