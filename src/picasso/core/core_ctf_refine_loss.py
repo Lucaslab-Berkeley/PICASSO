@@ -28,6 +28,12 @@ from torch_fourier_slice import extract_central_slices_rfft_3d, transform_slice_
 
 _CACHE_KEY = "_picasso_loss_cache"
 
+# With ``backward_weight``, backpropagate after at most this many particles. The
+# autograd graph costs ~7 MB per particle at box 512, so this caps the loss's
+# memory at a few GB; one backward per micrograph is fastest when it fits
+# (backward every 32 particles was ~40% slower on a 408-particle micrograph).
+BACKWARD_GROUP_PARTICLES = 512
+
 
 def _make_rfft_hermitian(spectrum: torch.Tensor, full_width: int) -> torch.Tensor:
     """Enforce Hermitian symmetry on the self-conjugate columns of an RFFT.
@@ -253,6 +259,8 @@ def per_call_kwargs(
 def compute_particle_z_scores(
     particle_backend_kwargs: dict[str, Any],
     batch_size: int,
+    backward_weight: float | None = None,
+    backward_group: int = BACKWARD_GROUP_PARTICLES,
 ) -> torch.Tensor:
     """Differentiable z-score of each particle at its fixed pose.
 
@@ -266,6 +274,14 @@ def compute_particle_z_scores(
         particle.
     batch_size : int
         Number of particles processed per chunk.
+    backward_weight : float | None
+        If given, backpropagate ``backward_weight * z.sum()`` in groups of at most
+        ``backward_group`` particles, accumulating gradients into the parameters
+        and freeing each group's graph before the next one, so the loss's memory
+        does not grow with the number of particles. The returned z-scores are
+        detached.
+    backward_group : int
+        Particles per backward pass when ``backward_weight`` is given.
 
     Returns
     -------
@@ -331,6 +347,8 @@ def compute_particle_z_scores(
             phase_shift = phase_shift.reshape(())
 
     z_scores = []
+    pending: list[torch.Tensor] = []  # z of chunks not yet backpropagated
+    pending_count = 0
     for start in range(0, num_particles, batch_size):
         stop = min(start + batch_size, num_particles)
         count = stop - start
@@ -395,6 +413,19 @@ def compute_particle_z_scores(
             )[..., :crop_h, :crop_w]
             z = (cross_corr - corr_mean[start:stop]) / corr_std[start:stop]
             z = z.reshape(count, -1).amax(dim=-1)
+        if backward_weight is not None:
+            pending.append(z)
+            pending_count += count
+            z = z.detach()
+            if pending_count >= backward_group or stop == num_particles:
+                # Parameter-dependent inputs shared by all chunks (defocus, angle,
+                # mag matrix, Zernikes) must survive until the last backward; each
+                # group's own graph is freed once its tensors are dropped.
+                group_sum = torch.stack([zc.sum() for zc in pending]).sum()
+                (backward_weight * group_sum).backward(
+                    retain_graph=stop < num_particles
+                )
+                pending, pending_count = [], 0
         z_scores.append(z)
 
     return torch.cat(z_scores)

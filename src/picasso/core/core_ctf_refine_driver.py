@@ -39,12 +39,13 @@ from picasso.core.core_ctf_refine_loss import (
 from picasso.core.core_ctf_refine_utils import (
     accumulate_gradients_from_gpu_worker,
     apply_dataset_params,
+    balance_micrographs_across_gpus,
     check_convergence,
     clamp_phase_shift_quadratic_after_step,
     compute_micrograph_loss,
+    count_particles,
     create_final_results_dict,
     create_gpu_setup_states,
-    distribute_micrographs_across_gpus,
     get_particle_positions_normalized,
     output_mag_matrix,
     phase_shift_quadratic_from_quad_params,
@@ -245,7 +246,7 @@ def _micrograph_loop(
     state: MicrographState,
     dataset_params: dict[str, Any],
     optimize: bool,
-    need_grad: bool,
+    grad_weight: float | None,
     num_micrographs: int,
 ) -> tuple[torch.Tensor, MicrographState]:
     """Evaluate (and optionally optimize) one micrograph.
@@ -269,16 +270,17 @@ def _micrograph_loop(
         Dataset-level parameters on ``device`` (mag matrix, Zernikes, offsets).
     optimize : bool
         Run the per-micrograph optimizers before the final evaluation.
-    need_grad : bool
-        Keep the autograd graph of the returned loss (for dataset-level grads).
+    grad_weight : float | None
+        If given, the final evaluation also accumulates the gradient of
+        ``grad_weight * loss`` into the dataset-level parameters.
     num_micrographs : int
         Total number of micrographs, for log messages.
 
     Returns
     -------
     tuple[torch.Tensor, MicrographState]
-        Scalar loss (mean of -z over particles) at the returned parameters,
-        and the returned per-micrograph state (``loss`` filled in).
+        Scalar loss (mean of -z over particles, detached) at the returned
+        parameters, and the returned per-micrograph state (``loss`` filled in).
     """
     pbk = get_inputs()
     # Grad enabled so the beam-tilt Zernikes derived from the (possibly trainable)
@@ -408,9 +410,18 @@ def _micrograph_loop(
             else:
                 pbk["ctf_kwargs"]["phase_shift"] = phase_shift
 
-    def micrograph_loss() -> torch.Tensor:
+    def evaluate(backward_weight: float | None = None) -> torch.Tensor:
+        """Mean loss over particles.
+
+        With ``backward_weight``, also accumulate the gradient of
+        ``backward_weight * mean loss``, chunk by chunk, and return it detached.
+        """
         apply_parameters()
-        return compute_micrograph_loss(pbk, opts.batch_size).mean()
+        if backward_weight is None:
+            return compute_micrograph_loss(pbk, opts.batch_size).mean()
+        return compute_micrograph_loss(
+            pbk, opts.batch_size, backward_weight=backward_weight / num_particles
+        ).mean()
 
     all_params = [p for group in groups.values() for pg in group for p in pg["params"]]
 
@@ -437,10 +448,9 @@ def _micrograph_loop(
 
                         def closure() -> torch.Tensor:
                             clear_grads()
-                            loss = micrograph_loss()
-                            loss.backward()
+                            loss = evaluate(1.0)
                             _raise_if_nonfinite(loss, all_params, f"micrograph {i + 1}")
-                            return loss.detach()
+                            return loss
 
                         step_loss = float(optimizer.step(closure))  # type: ignore[arg-type]
                         if start_loss is None:
@@ -450,10 +460,9 @@ def _micrograph_loop(
                 else:
                     # Adam: one forward/backward, then step every group.
                     clear_grads()
-                    loss = micrograph_loss()
-                    loss.backward()
+                    loss = evaluate(1.0)
                     _raise_if_nonfinite(loss, all_params, f"micrograph {i + 1}")
-                    start_loss = float(loss.detach())
+                    start_loss = float(loss)
                     for optimizer in optimizers.values():
                         optimizer.step()
                     after_step()
@@ -477,12 +486,12 @@ def _micrograph_loop(
             param.requires_grad_(False)
 
     # Final evaluation at the returned parameters.
-    if need_grad:
+    if grad_weight is not None:
         with torch.enable_grad():
-            loss = micrograph_loss()
+            loss = evaluate(grad_weight)
     else:
         with torch.no_grad():
-            loss = micrograph_loss()
+            loss = evaluate()
 
     with torch.no_grad():
         if opts.refine_astigmatism:
@@ -514,7 +523,7 @@ def _micrograph_loop(
     if optimize and groups:
         _print_micrograph_summary(i, num_micrographs, opts, new_state)
 
-    return (loss if need_grad else loss.detach()), new_state
+    return loss.detach(), new_state
 
 
 def _print_micrograph_summary(
@@ -669,11 +678,16 @@ def run_ctf_refinement(
         log_file.flush()
 
     try:
-        gpu_assignments = distribute_micrographs_across_gpus(num_micrographs, num_gpus)
+        gpu_assignments = balance_micrographs_across_gpus(
+            [count_particles(path) for path in results_files], num_gpus
+        )
         _log_message(f"\nUsing {num_gpus} device(s):", log_file)
         for gpu_id, indices in enumerate(gpu_assignments):
+            particles = sum(count_particles(results_files[i]) for i in indices)
             _log_message(
-                f"  {device_list[gpu_id]}: {len(indices)} micrographs", log_file
+                f"  {device_list[gpu_id]}: {len(indices)} micrographs, "
+                f"~{particles} particles",
+                log_file,
             )
 
         templates = [template.to(device) for device in device_list]
@@ -737,21 +751,26 @@ def run_ctf_refinement(
                     state=states[i],
                     dataset_params=local_params[gpu_id],
                     optimize=optimize,
-                    need_grad=False,
+                    grad_weight=None,
                     num_micrographs=num_micrographs,
                 )
-                if device_list[gpu_id].type == "cuda":
-                    torch.cuda.empty_cache()
                 return new_state
 
             return job
 
-        def dataset_gradient_pass(states: dict[int, MicrographState]) -> float:
-            """Accumulate d(mean loss)/d(dataset params) into the master params."""
+        def dataset_gradient_pass(
+            states: dict[int, MicrographState],
+        ) -> tuple[float, dict[int, MicrographState]]:
+            """Loss of every micrograph and d(mean loss)/d(dataset params).
+
+            Gradients are accumulated into the master parameters' ``.grad``.
+            """
             sync_local_params()
 
-            def job(i: int, gpu_id: int) -> tuple[float, dict[str, torch.Tensor]]:
-                loss, _ = _micrograph_loop(
+            def job(
+                i: int, gpu_id: int
+            ) -> tuple[MicrographState, dict[str, torch.Tensor]]:
+                _, new_state = _micrograph_loop(
                     i=i,
                     results_path=results_files[i],
                     get_inputs=inputs_getter(i, gpu_id),
@@ -760,21 +779,15 @@ def run_ctf_refinement(
                     state=states[i],
                     dataset_params=local_params[gpu_id],
                     optimize=False,
-                    need_grad=True,
+                    grad_weight=1.0 / num_micrographs,
                     num_micrographs=num_micrographs,
                 )
-                with torch.enable_grad():
-                    (loss / num_micrographs).backward()
                 grads = (
                     _collect_local_grads(local_params[gpu_id], primary_device, opts)
                     if num_gpus > 1
                     else {}
                 )
-                value = float(loss.detach())
-                del loss
-                if device_list[gpu_id].type == "cuda":
-                    torch.cuda.empty_cache()
-                return value, grads
+                return new_state, grads
 
             results = _run_over_micrographs(job, gpu_assignments)
             for _, grads in results.values():
@@ -786,17 +799,60 @@ def run_ctf_refinement(
                     refine_anisotropic_mag=opts.refine_anisotropic_mag,
                     refine_beam_tilt=opts.refine_beam_tilt,
                 )
-            avg_loss = sum(value for value, _ in results.values()) / num_micrographs
+            new_states = {i: state for i, (state, _) in results.items()}
+            avg_loss = sum(s.loss for s in new_states.values()) / num_micrographs
             _raise_if_nonfinite(
                 avg_loss,
-                [anistropic_mag, *odd_zernikes.values()],
+                dataset_param_list,
                 "the dataset-level gradient (anisotropic magnification / beam tilt)",
             )
-            return avg_loss
+            return avg_loss, new_states
 
         def zero_dataset_grads() -> None:
             for optimizer in dataset_optimizers:
                 optimizer.zero_grad(set_to_none=True)
+
+        # The last evaluation (loss, per-micrograph states and gradients), keyed by
+        # the dataset-level parameter values and a version of the per-micrograph
+        # values. Each L-BFGS step starts by re-evaluating where the previous step
+        # ended, and the loss after a step is usually the last closure's.
+        dataset_param_list = [anistropic_mag, *odd_zernikes.values()]
+        last_evaluation: dict[str, Any] = {}
+        states_version = [0]
+
+        def evaluation_key() -> tuple[Any, ...]:
+            return (
+                states_version[0],
+                tuple(p.detach().cpu().numpy().tobytes() for p in dataset_param_list),
+            )
+
+        def evaluate_dataset(
+            states: dict[int, MicrographState],
+        ) -> tuple[float, dict[int, MicrographState], bool]:
+            """Dataset loss and gradients at the current dataset-level parameters.
+
+            Sets ``.grad`` of the dataset-level parameters. Returns the average
+            loss, the evaluated states and whether a previous result was reused.
+            """
+            key = evaluation_key()
+            if last_evaluation.get("key") == key:
+                for param, grad in zip(
+                    dataset_param_list, last_evaluation["grads"], strict=True
+                ):
+                    param.grad = None if grad is None else grad.clone()
+                return last_evaluation["avg"], last_evaluation["states"], True
+            zero_dataset_grads()
+            avg, new_states = dataset_gradient_pass(states)
+            last_evaluation.update(
+                key=key,
+                avg=avg,
+                states=new_states,
+                grads=[
+                    None if p.grad is None else p.grad.detach().clone()
+                    for p in dataset_param_list
+                ],
+            )
+            return avg, new_states, False
 
         def lbfgs_dataset_step(
             optimizer: torch.optim.Optimizer, states: dict[int, MicrographState]
@@ -806,10 +862,10 @@ def run_ctf_refinement(
 
             def closure() -> torch.Tensor:
                 evaluations[0] += 1
-                zero_dataset_grads()
-                avg = dataset_gradient_pass(states)
+                avg, _, reused = evaluate_dataset(states)
                 _log_message(
-                    f"  L-BFGS closure #{evaluations[0]}: avg loss {avg:.6f}",
+                    f"  L-BFGS closure #{evaluations[0]}: avg loss {avg:.6f}"
+                    + (" (reused)" if reused else ""),
                     log_file,
                 )
                 return torch.tensor(avg, device=primary_device)
@@ -829,9 +885,13 @@ def run_ctf_refinement(
                 start.phase_shift = initial_phase_shift[i]
             start_states[i] = start
         sync_local_params()
-        states = _run_over_micrographs(
-            make_job(start_states, optimize=False), gpu_assignments
-        )
+        if opts.refine_dataset_level and not opts.refine_per_micrograph:
+            # Also gives the gradients the first dataset-level step starts from.
+            _, states, _ = evaluate_dataset(start_states)
+        else:
+            states = _run_over_micrographs(
+                make_job(start_states, optimize=False), gpu_assignments
+            )
         initial_avg_loss = sum(s.loss for s in states.values()) / num_micrographs
         _log_message(
             f"Initial avg loss (before any optimization): {initial_avg_loss:.6f}",
@@ -870,6 +930,7 @@ def run_ctf_refinement(
                             f"{states[i].loss:.6f}); keeping starting values.",
                             log_file,
                         )
+                states_version[0] += 1
                 reference_states = dict(states)
                 reference_avg_loss = (
                     sum(s.loss for s in states.values()) / num_micrographs
@@ -886,15 +947,14 @@ def run_ctf_refinement(
                     for optimizer in dataset_optimizers:
                         lbfgs_dataset_step(optimizer, states)
                 else:
-                    zero_dataset_grads()
-                    dataset_gradient_pass(states)
+                    evaluate_dataset(states)
                     for optimizer in dataset_optimizers:
                         optimizer.step()
+                # Loss at the new parameters: usually the last L-BFGS closure's; for
+                # Adam this pass also gives the next step's gradients.
+                _, states, _ = evaluate_dataset(states)
                 zero_dataset_grads()
                 sync_local_params()
-                states = _run_over_micrographs(
-                    make_job(states, optimize=False), gpu_assignments
-                )
                 _log_dataset_params(opts, anistropic_mag, odd_zernikes, log_file)
 
             avg_loss = sum(s.loss for s in states.values()) / num_micrographs

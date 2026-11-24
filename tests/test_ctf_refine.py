@@ -49,7 +49,19 @@ class SyntheticProblem:
             pbk["mag_matrix"] = kwargs["anistropic_mag"]
         return pbk
 
-    def loss(self, pbk: dict[str, Any], batch_size: int) -> torch.Tensor:
+    def loss(
+        self,
+        pbk: dict[str, Any],
+        batch_size: int,
+        backward_weight: float | None = None,
+    ) -> torch.Tensor:
+        loss = self._loss(pbk)
+        if backward_weight is not None:
+            (backward_weight * loss.sum()).backward()
+            return loss.detach()
+        return loss
+
+    def _loss(self, pbk: dict[str, Any]) -> torch.Tensor:
         mean_df = (pbk["defocus_u"] + pbk["defocus_v"]) / 2
         magnitude = pbk["defocus_u"] - pbk["defocus_v"]
         true_mean = (CSV_DU + CSV_DV) / 2 + TRUE_DEFOCUS
@@ -475,8 +487,14 @@ def test_inactive_zernike_dict_detection():
 
 
 def test_non_finite_loss_stops_refinement(synthetic, monkeypatch):
-    def nan_loss(pbk: dict[str, Any], batch_size: int) -> torch.Tensor:
-        return synthetic.loss(pbk, batch_size) * torch.tensor(float("nan"))
+    def nan_loss(
+        pbk: dict[str, Any], batch_size: int, backward_weight: float | None = None
+    ) -> torch.Tensor:
+        loss = synthetic._loss(pbk) * torch.tensor(float("nan"))
+        if backward_weight is not None:
+            (backward_weight * loss.sum()).backward()
+            return loss.detach()
+        return loss
 
     monkeypatch.setattr(driver, "compute_micrograph_loss", nan_loss)
     with pytest.raises(FloatingPointError, match="Non-finite loss in micrograph 1"):
@@ -625,3 +643,69 @@ def test_compacted_inputs_give_same_z_scores(shared_filter):
             per_call_kwargs(cached, template_dft), batch_size=4
         )
         torch.testing.assert_close(z, reference)
+
+
+# ---------------------------------------------------------------------------
+# Chunked backward, reused evaluations, GPU balancing
+# ---------------------------------------------------------------------------
+
+
+def test_chunked_backward_matches_full_backward():
+    torch.set_grad_enabled(True)
+    kwargs = _synthetic_backend_kwargs(32, 7, torch.device("cpu"))
+
+    def grads(chunked: bool) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        du = kwargs["defocus_u"].clone().requires_grad_(True)
+        mag = torch.tensor([[1.002, 0.001], [0.0005, 0.998]], requires_grad=True)
+        local = dict(kwargs, defocus_u=du, mag_matrix=mag)
+        if chunked:
+            z = compute_particle_z_scores(
+                local, batch_size=2, backward_weight=0.5, backward_group=3
+            )
+            assert not z.requires_grad
+        else:
+            z = compute_particle_z_scores(local, batch_size=2)
+            (0.5 * z.sum()).backward()
+        return z.detach(), [du.grad, mag.grad]
+
+    z_full, g_full = grads(chunked=False)
+    z_chunk, g_chunk = grads(chunked=True)
+    torch.testing.assert_close(z_chunk, z_full)
+    for a, b in zip(g_chunk, g_full, strict=True):
+        # Summing gradients group by group changes float32 rounding slightly.
+        torch.testing.assert_close(a, b, rtol=1e-4, atol=1e-4)
+
+
+def test_lbfgs_step_start_is_not_recomputed(synthetic, monkeypatch, capsys):
+    """Each L-BFGS step's first closure and the post-step loss reuse results."""
+    synthetic.target_mag = torch.tensor([[1.01, 0.0], [0.0, 0.99]])
+    calls = {"grad": 0}
+    original = driver._micrograph_loop
+
+    def counting_loop(**kwargs: Any):
+        calls["grad"] += int(kwargs["grad_weight"] is not None)
+        return original(**kwargs)
+
+    monkeypatch.setattr(driver, "_micrograph_loop", counting_loop)
+    capsys.readouterr()
+    result = run(refine_anisotropic_mag=True, per_dataset_iterations=3)
+    out = capsys.readouterr().out
+    iterations = len(result["dataset_losses"])
+    closures = out.count("L-BFGS closure #")
+    reused = out.count("(reused)")
+    assert reused >= iterations  # every step starts where the previous one ended
+    gradient_passes = calls["grad"] / 2  # two micrographs
+    # Initial pass + the closures that were actually computed, plus at most one
+    # post-step evaluation per iteration that the last closure did not cover.
+    computed = 1 + closures - reused
+    assert computed <= gradient_passes <= computed + iterations
+
+
+def test_balance_micrographs_across_gpus():
+    from picasso.core.core_ctf_refine_utils import balance_micrographs_across_gpus
+
+    assignments = balance_micrographs_across_gpus([100, 100, 100, 100], 3)
+    assert sorted(len(a) for a in assignments) == [1, 1, 2]
+    assignments = balance_micrographs_across_gpus([400, 50, 50, 50, 50, 50], 2)
+    assert assignments == [[0], [1, 2, 3, 4, 5]]  # 400 vs 250 particles
+    assert balance_micrographs_across_gpus([5, 5], 1) == [[0, 1]]

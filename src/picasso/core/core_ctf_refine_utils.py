@@ -314,6 +314,7 @@ def setup_particle_backend_for_micrograph(
 def compute_micrograph_loss(
     particle_backend_kwargs: dict[str, Any],
     batch_size: int,
+    backward_weight: float | None = None,
 ) -> torch.Tensor:
     """Per-particle loss (negative z-score) for one micrograph.
 
@@ -323,13 +324,17 @@ def compute_micrograph_loss(
         Particle backend kwargs.
     batch_size : int
         Number of particles processed per chunk.
+    backward_weight : float | None
+        If given, backpropagate ``backward_weight * loss.sum()`` chunk by chunk
+        (see ``compute_particle_z_scores``) and return the loss detached.
 
     Returns
     -------
     torch.Tensor
         Shape (N,) negative z-scores.
     """
-    return -compute_particle_z_scores(particle_backend_kwargs, batch_size)
+    weight = None if backward_weight is None else -backward_weight
+    return -compute_particle_z_scores(particle_backend_kwargs, batch_size, weight)
 
 
 def create_optimizer_aniso(
@@ -559,6 +564,46 @@ def distribute_micrographs_across_gpus(
     for idx, mic_idx in enumerate(range(num_micrographs)):
         gpu_assignments[idx % num_gpus].append(mic_idx)
     return gpu_assignments
+
+
+def balance_micrographs_across_gpus(
+    weights: list[float],
+    num_gpus: int,
+) -> list[list[int]]:
+    """Assign micrographs to GPUs so each GPU gets a similar total weight.
+
+    Greedy longest-processing-time assignment: heaviest micrograph first, each to
+    the GPU with the least weight so far. Use particle counts as weights, since
+    the time per micrograph is roughly proportional to its number of particles.
+
+    Parameters
+    ----------
+    weights : list[float]
+        Weight (e.g. number of particles) of each micrograph.
+    num_gpus : int
+        Number of GPUs.
+
+    Returns
+    -------
+    list[list[int]]
+        Micrograph indices for each GPU, in increasing order.
+    """
+    loads = [0.0] * num_gpus
+    assignments: list[list[int]] = [[] for _ in range(num_gpus)]
+    for index in sorted(range(len(weights)), key=lambda k: (-weights[k], k)):
+        gpu_id = min(range(num_gpus), key=lambda g: (loads[g], g))
+        assignments[gpu_id].append(index)
+        loads[gpu_id] += weights[index]
+    return [sorted(indices) for indices in assignments]
+
+
+def count_particles(results_path: str) -> int:
+    """Number of particle rows in a results CSV (1 if it cannot be read)."""
+    try:
+        with open(results_path, encoding="utf-8") as handle:
+            return max(sum(1 for _ in handle) - 1, 1)
+    except OSError:
+        return 1
 
 
 def create_gpu_setup_states(
