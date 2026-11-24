@@ -128,6 +128,11 @@ class CTFRefineManager(BaseModelPICASSO):
             "initial_phase_shift_quadratic_k2": (
                 self.ctf_refine_config.phase_shift_quadratic_k2
             ),
+            "setup_cache_gpu_gb": self.ctf_refine_config.setup_cache_gpu_gb,
+            "setup_cache_host_gb": self.ctf_refine_config.setup_cache_host_gb,
+            "joint_per_micrograph_lbfgs": (
+                self.ctf_refine_config.joint_per_micrograph_lbfgs
+            ),
         }
 
         return backend_kwargs
@@ -327,8 +332,14 @@ class CTFRefineManager(BaseModelPICASSO):
             # Read CSV file
             df = pd.read_csv(results_file)
 
+            # Only columns of refined parameters are written; the results dict
+            # always carries mag matrix, Zernikes and astigmatism, and writing
+            # unrefined values would overwrite what the CSV already holds.
             # Update mag_matrix
-            if "anistropic_mag" in refined_ctf_params:
+            if (
+                self.ctf_refine_config.refine_anisotropic_mag
+                and "anistropic_mag" in refined_ctf_params
+            ):
                 mag_matrix = refined_ctf_params["anistropic_mag"]
                 # Convert 2x2 matrix to flat list [a, b, c, d]
                 if isinstance(mag_matrix, torch.Tensor):
@@ -347,7 +358,10 @@ class CTFRefineManager(BaseModelPICASSO):
                 df["mag_matrix"] = mag_str
 
             # Update odd_zernikes
-            if "odd_zernikes" in refined_ctf_params:
+            if (
+                self.ctf_refine_config.refine_beam_tilt
+                and "odd_zernikes" in refined_ctf_params
+            ):
                 odd_zernikes = refined_ctf_params["odd_zernikes"]
                 # Convert dict to string format like {"Z31c": 0.0, "Z31s": 0.0}
                 zernike_dict = {}
@@ -368,7 +382,8 @@ class CTFRefineManager(BaseModelPICASSO):
 
             # Update defocus_u and defocus_v from astigmatism
             if (
-                "astigmatism_angle" in refined_ctf_params
+                self.ctf_refine_config.refine_astigmatism
+                and "astigmatism_angle" in refined_ctf_params
                 and "astigmatism_magnitude" in refined_ctf_params
             ):
                 astigmatism_angle = refined_ctf_params["astigmatism_angle"]
@@ -420,7 +435,10 @@ class CTFRefineManager(BaseModelPICASSO):
 
             # Update defocus values (refined_relative_defocus or relative_defocus)
             # Add the refined defocus_tensor to the existing column values
-            if "defocus_all" in refined_ctf_params:
+            if (
+                self.ctf_refine_config.refine_defocus
+                and "defocus_all" in refined_ctf_params
+            ):
                 defocus_all = refined_ctf_params["defocus_all"]
                 if micrograph_idx in defocus_all:
                     defocus_tensor = defocus_all[micrograph_idx]
@@ -450,7 +468,10 @@ class CTFRefineManager(BaseModelPICASSO):
                         df["refined_relative_defocus"] = defocus_values
 
             # Update phase_shift values
-            if "phase_shift_all" in refined_ctf_params:
+            if (
+                self.ctf_refine_config.refine_phase_shift
+                and "phase_shift_all" in refined_ctf_params
+            ):
                 phase_shift_all = refined_ctf_params["phase_shift_all"]
                 if micrograph_idx in phase_shift_all:
                     phase_shift_tensor = phase_shift_all[micrograph_idx]
@@ -460,9 +481,9 @@ class CTFRefineManager(BaseModelPICASSO):
                         phase_shift_values = np.array(phase_shift_tensor)
 
                     # Check if per-micrograph (scalar) or per-particle (array)
-                    if phase_shift_values.ndim == 0 or len(phase_shift_values) == 1:
+                    if phase_shift_values.size == 1:
                         # Per-micrograph: single value for all particles
-                        phase_shift_val = float(phase_shift_values)
+                        phase_shift_val = float(phase_shift_values.reshape(-1)[0])
                         if "phase_shift" not in df.columns:
                             df["phase_shift"] = ""
                         df["phase_shift"] = phase_shift_val

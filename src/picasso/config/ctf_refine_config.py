@@ -24,6 +24,8 @@ class CtfRefineConfig(BaseModelPICASSO):
     lbfgs_max_eval: int = 5
     anisotropic_mag_lr: float = 0.005
     beam_tilt_lr: float = 0.01
+    # Unused: astigmatism is refined as two Cartesian components in Å, both with
+    # astigmatism_magnitude_lr. Kept so existing configs still load.
     astigmatism_angle_lr: float = 5.0
     astigmatism_magnitude_lr: float = 5.0
     defocus_lr: float = 5.0
@@ -38,6 +40,14 @@ class CtfRefineConfig(BaseModelPICASSO):
     phase_shift_quadratic_two_axes: bool = False
     phase_shift_quadratic_g2: float = 0.0
     phase_shift_quadratic_k2: float = 0.0
+    # Memory for keeping each micrograph's inputs between passes instead of
+    # re-reading and re-filtering it. None: 40% of each GPU's memory / of the
+    # available host memory. 0 disables that tier.
+    setup_cache_gpu_gb: float | None = None
+    setup_cache_host_gb: float | None = None
+    # With the L-BFGS optimizer: refine a micrograph's astigmatism, defocus and
+    # phase shift with one optimizer (True) or one per parameter group in turn.
+    joint_per_micrograph_lbfgs: bool = True
 
     @model_validator(mode="after")  # type: ignore
     def validate_optimizer(self) -> Self:

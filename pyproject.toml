@@ -19,7 +19,7 @@ name = "PICASSO"
 dynamic = ["version"]
 description = "Projection Improvement by Ctf Aberration, magnification aniSotropy, and Scattering factor Optimization"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"  # leopard-em requires >=3.11
 license = { text = "BSD-3-Clause" }
 authors = [{ name = "Josh Dickerson", email = "jdickerson@berkeley.edu" }]
 # https://pypi.org/classifiers/
@@ -27,7 +27,6 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "License :: OSI Approved :: BSD License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -45,9 +44,11 @@ dependencies = [
     "pyyaml",
     "types-PyYAML",
     "leopard-em",
+    "roma",
     "torch-ctf",
     "torch-ctf-estimation",
     "torch-grid-utils",
+    "torch-fourier-slice",
     "tqdm",
     "matplotlib",
 ]
@@ -90,8 +91,9 @@ PICASSO = { workspace = true }
 leopard-em = { path = "/home/jdickerson/git/LucasLab/Leopard-EM", editable = true }
 torch-ctf = { path = "/home/jdickerson/git/teamtomo/torch-ctf", editable = true }
 torch-ctf-estimation = { path = "/home/jdickerson/git/teamtomo/torch-ctf-estimation", editable = true }
-torch-grid-utils = { path = "/home/jdickerson/git/teamtomo/torch-grid-utils", editable = true }
-torch-fourier-slice = { path = "/home/jdickerson/git/teamtomo/torch-fourier-slice", editable = true }
+# torch-grid-utils and torch-fourier-slice come from PyPI: their standalone
+# repositories are archived (development moved to the teamtomo monorepo) and the
+# local checkouts (v0.1.2, v0.4.0) are older than Leopard-EM requires (>=0.5.2).
 
 # https://docs.astral.sh/ruff
 [tool.ruff]
