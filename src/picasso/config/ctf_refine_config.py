@@ -45,6 +45,9 @@ class CtfRefineConfig(BaseModelPICASSO):
     # available host memory. 0 disables that tier.
     setup_cache_gpu_gb: float | None = None
     setup_cache_host_gb: float | None = None
+    # With the L-BFGS optimizer: refine a micrograph's astigmatism, defocus and
+    # phase shift with one optimizer (True) or one per parameter group in turn.
+    joint_per_micrograph_lbfgs: bool = True
 
     @model_validator(mode="after")  # type: ignore
     def validate_optimizer(self) -> Self:

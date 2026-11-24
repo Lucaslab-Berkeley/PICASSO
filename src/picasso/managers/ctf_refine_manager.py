@@ -130,6 +130,9 @@ class CTFRefineManager(BaseModelPICASSO):
             ),
             "setup_cache_gpu_gb": self.ctf_refine_config.setup_cache_gpu_gb,
             "setup_cache_host_gb": self.ctf_refine_config.setup_cache_host_gb,
+            "joint_per_micrograph_lbfgs": (
+                self.ctf_refine_config.joint_per_micrograph_lbfgs
+            ),
         }
 
         return backend_kwargs

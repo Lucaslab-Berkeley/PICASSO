@@ -803,3 +803,59 @@ def test_mag_matrix_starts_from_results_csv(synthetic, tmp_path, refine):
     torch.testing.assert_close(
         result["anistropic_mag"], synthetic.target_mag, atol=1e-6, rtol=0
     )
+
+
+# ---------------------------------------------------------------------------
+# Joint vs block-coordinate per-micrograph L-BFGS
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("joint", [True, False])
+def test_per_micrograph_lbfgs_modes_reach_optimum(synthetic, joint):
+    result = run(
+        refine_astigmatism=True,
+        refine_defocus=True,
+        refine_phase_shift=True,
+        per_micrograph_iterations=10,
+        astigmatism_magnitude_lr=1.0,
+        defocus_lr=0.05,
+        phase_shift_lr=1.0,
+        joint_per_micrograph_lbfgs=joint,
+    )
+    torch.testing.assert_close(
+        result["astigmatism_magnitude"], torch.full((2,), TRUE_MAG), atol=1.0, rtol=0
+    )
+    torch.testing.assert_close(
+        result["astigmatism_angle"], torch.full((2,), TRUE_ANGLE), atol=0.1, rtol=0
+    )
+    for offsets in result["defocus_all"].values():
+        torch.testing.assert_close(offsets, TRUE_DEFOCUS, atol=1.0, rtol=0)
+    for phase in result["phase_shift_all"].values():
+        torch.testing.assert_close(phase, torch.tensor(TRUE_PHASE), atol=0.1, rtol=0)
+
+
+def test_joint_lbfgs_uses_one_optimizer(synthetic, monkeypatch):
+    created = []
+    original = torch.optim.LBFGS
+
+    class CountingLBFGS(original):  # type: ignore[misc,valid-type]
+        def __init__(self, params: Any, **kwargs: Any) -> None:
+            created.append(kwargs.get("lr"))
+            super().__init__(params, **kwargs)
+
+    monkeypatch.setattr(torch.optim, "LBFGS", CountingLBFGS)
+    run(
+        refine_astigmatism=True,
+        refine_defocus=True,
+        per_micrograph_iterations=2,
+        joint_per_micrograph_lbfgs=True,
+    )
+    assert created == [1.0, 1.0]  # one optimizer per micrograph
+    created.clear()
+    run(
+        refine_astigmatism=True,
+        refine_defocus=True,
+        per_micrograph_iterations=2,
+        joint_per_micrograph_lbfgs=False,
+    )
+    assert len(created) == 4  # two groups per micrograph

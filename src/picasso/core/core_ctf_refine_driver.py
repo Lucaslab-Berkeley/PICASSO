@@ -42,7 +42,6 @@ from picasso.core.core_ctf_refine_utils import (
     apply_dataset_params,
     balance_micrographs_across_gpus,
     check_convergence,
-    clamp_phase_shift_quadratic_after_step,
     common_results_mag_matrix,
     compute_micrograph_loss,
     count_particles,
@@ -96,6 +95,7 @@ class RefineOptions:
     initial_phase_shift_quadratic_k2: float
     setup_cache_gpu_gb: float | None = None
     setup_cache_host_gb: float | None = None
+    joint_per_micrograph_lbfgs: bool = True
 
     @property
     def refine_per_micrograph(self) -> bool:
@@ -306,7 +306,30 @@ def _micrograph_loop(
 
     trainable = optimize
     groups: dict[str, list[dict[str, Any]]] = {}
-    lbfgs_lrs: dict[str, float] = {}
+    lbfgs_lrs: dict[str, float] = {
+        "astigmatism": opts.astigmatism_magnitude_lr,
+        "defocus": 1000.0 * opts.defocus_lr,
+        "phase_shift": opts.phase_shift_lr,
+    }
+    # With one L-BFGS over all per-micrograph parameters, each group is stored
+    # divided by a scale (physical value = scale * leaf) chosen so all groups have
+    # similar curvature in the optimizer's coordinates; otherwise L-BFGS stalls
+    # until its curvature history makes up the difference. The loss is a mean
+    # over particles, so a per-particle parameter (one particle) has ~N/8 times
+    # less curvature than an astigmatism component (all particles): per-particle
+    # groups get sqrt(N) / 2 times the scale of the per-micrograph ones.
+    joint = opts.optimizer_type == "lbfgs" and opts.joint_per_micrograph_lbfgs
+    if joint:
+        per_particle = 0.5 * math.sqrt(num_particles)
+        phase_per_particle = opts.phase_shift_mode == "per_particle"
+        scale = {
+            "astigmatism": opts.astigmatism_magnitude_lr,
+            "defocus": opts.astigmatism_magnitude_lr * per_particle,
+            "phase_shift": opts.phase_shift_lr
+            * (per_particle if phase_per_particle else 1.0),
+        }
+    else:
+        scale = dict.fromkeys(lbfgs_lrs, 1.0)
 
     # --- astigmatism (per micrograph) ------------------------------------------
     # Refined as Cartesian components in Å, a = m * (cos 2θ, sin 2θ), with
@@ -338,22 +361,25 @@ def _micrograph_loop(
         # astigmatism; start from at least MIN_START_ASTIGMATISM instead.
         start_magnitude = max(start_magnitude, MIN_START_ASTIGMATISM)
         two_theta = math.radians(2.0 * start_angle)
-        astig_xy = torch.tensor(
-            [
-                start_magnitude * math.cos(two_theta),
-                start_magnitude * math.sin(two_theta),
-            ],
-            device=device,
+        astig_xy = (
+            torch.tensor(
+                [
+                    start_magnitude * math.cos(two_theta),
+                    start_magnitude * math.sin(two_theta),
+                ],
+                device=device,
+            )
+            / scale["astigmatism"]
         ).requires_grad_(trainable)
         defocus_mean = (csv_du + csv_dv) / 2.0
         groups["astigmatism"] = [
             {"params": [astig_xy], "lr": opts.astigmatism_magnitude_lr}
         ]
-        lbfgs_lrs["astigmatism"] = opts.astigmatism_magnitude_lr
 
     def astigmatism_polar() -> tuple[torch.Tensor, torch.Tensor]:
         """Magnitude (defocus_u - defocus_v, Å) and angle (deg) from astig_xy."""
-        a_cos, a_sin = astig_xy[0], astig_xy[1]
+        components = astig_xy * scale["astigmatism"]
+        a_cos, a_sin = components[0], components[1]
         magnitude = torch.sqrt(a_cos**2 + a_sin**2 + 1e-12)
         at_origin = (a_cos == 0) & (a_sin == 0)
         safe_cos = torch.where(at_origin, torch.ones_like(a_cos), a_cos)
@@ -373,9 +399,13 @@ def _micrograph_loop(
             start_defocus = state.defocus.reshape(-1).float().to(device)
         else:
             start_defocus = torch.zeros(num_particles, device=device)
-        defocus_offsets = start_defocus.detach().clone().requires_grad_(trainable)
+        defocus_offsets = (
+            (start_defocus / scale["defocus"])
+            .detach()
+            .clone()
+            .requires_grad_(trainable)
+        )
         groups["defocus"] = [{"params": [defocus_offsets], "lr": opts.defocus_lr}]
-        lbfgs_lrs["defocus"] = 1000.0 * opts.defocus_lr
 
     # --- phase shift --------------------------------------------------------------
     quad_params: dict[str, torch.Tensor] | None = None
@@ -384,7 +414,10 @@ def _micrograph_loop(
         if opts.phase_shift_mode == "quadratic":
             start_quad = _initial_quad_values(opts, state, csv_phase_shift)
             quad_params = {
-                key: torch.tensor(value, device=device, dtype=torch.float32)
+                key: (
+                    torch.tensor(value, device=device, dtype=torch.float32)
+                    / scale["phase_shift"]
+                )
                 .detach()
                 .requires_grad_(trainable)
                 for key, value in start_quad.items()
@@ -412,11 +445,19 @@ def _micrograph_loop(
                     f"Micrograph {i}: initial per-particle phase shift has "
                     f"{start_phase.numel()} values for {num_particles} particles."
                 )
-            phase_shift = start_phase.detach().clone().requires_grad_(trainable)
+            phase_shift = (
+                (start_phase / scale["phase_shift"])
+                .detach()
+                .clone()
+                .requires_grad_(trainable)
+            )
             groups["phase_shift"] = [
                 {"params": [phase_shift], "lr": opts.phase_shift_lr}
             ]
-        lbfgs_lrs["phase_shift"] = opts.phase_shift_lr
+
+    def quad_values() -> dict[str, torch.Tensor]:
+        assert quad_params is not None
+        return {k: v * scale["phase_shift"] for k, v in quad_params.items()}
 
     def apply_parameters() -> None:
         if opts.refine_astigmatism:
@@ -427,18 +468,19 @@ def _micrograph_loop(
         else:
             defocus_u, defocus_v, angle = csv_du, csv_dv, csv_angle
         if opts.refine_defocus:
-            defocus_u = defocus_u + defocus_offsets
-            defocus_v = defocus_v + defocus_offsets
+            offsets = defocus_offsets * scale["defocus"]
+            defocus_u = defocus_u + offsets
+            defocus_v = defocus_v + offsets
         pbk["defocus_u"] = defocus_u
         pbk["defocus_v"] = defocus_v
         pbk["defocus_angle"] = angle
         if opts.refine_phase_shift:
             if quad_params is not None and positions is not None:
                 pbk["ctf_kwargs"]["phase_shift"] = (
-                    phase_shift_quadratic_from_quad_params(positions, quad_params)
+                    phase_shift_quadratic_from_quad_params(positions, quad_values())
                 )
             else:
-                pbk["ctf_kwargs"]["phase_shift"] = phase_shift
+                pbk["ctf_kwargs"]["phase_shift"] = phase_shift * scale["phase_shift"]
 
     def evaluate(backward_weight: float | None = None) -> torch.Tensor:
         """Mean loss over particles.
@@ -461,18 +503,30 @@ def _micrograph_loop(
 
     def after_step() -> None:
         if quad_params is not None:
-            clamp_phase_shift_quadratic_after_step(quad_params)
+            # Keep the constant term C within [0, 180] degrees.
+            with torch.no_grad():
+                quad_params["C"].clamp_(min=0.0, max=180.0 / scale["phase_shift"])
 
     if optimize and groups:
-        optimizers = {
-            name: _make_optimizer(opts, group, lbfgs_lrs[name])
-            for name, group in groups.items()
-        }
+        if joint:
+            optimizers = {
+                "joint": torch.optim.LBFGS(
+                    all_params,
+                    lr=1.0,
+                    line_search_fn="strong_wolfe",
+                    max_eval=opts.lbfgs_max_eval,
+                )
+            }
+        else:
+            optimizers = {
+                name: _make_optimizer(opts, group, lbfgs_lrs[name])
+                for name, group in groups.items()
+            }
         history: list[float] = []
         with torch.enable_grad():
             for inner_iter in range(opts.per_micrograph_iterations):
                 if opts.optimizer_type == "lbfgs":
-                    # Block-coordinate L-BFGS: one optimizer per parameter group.
+                    # One joint L-BFGS, or one per parameter group (block-coordinate).
                     start_loss: float | None = None
                     for optimizer in optimizers.values():
 
@@ -536,17 +590,21 @@ def _micrograph_loop(
         else:
             out_angle = csv_angle[0].detach().clone()
             out_magnitude = (csv_du - csv_dv).mean().detach().clone()
-        out_defocus = defocus_offsets.detach().clone() if opts.refine_defocus else None
+        out_defocus = (
+            (defocus_offsets * scale["defocus"]).detach().clone()
+            if opts.refine_defocus
+            else None
+        )
         out_phase: torch.Tensor | None = None
         out_quad: dict[str, float] | None = None
         if opts.refine_phase_shift:
             if quad_params is not None and positions is not None:
                 out_phase = phase_shift_quadratic_from_quad_params(
-                    positions, quad_params
+                    positions, quad_values()
                 ).detach()
-                out_quad = quad_params_to_dict(quad_params)
+                out_quad = quad_params_to_dict(quad_values())
             else:
-                out_phase = phase_shift.detach().clone()
+                out_phase = (phase_shift * scale["phase_shift"]).detach().clone()
 
     new_state = MicrographState(
         loss=float(loss.detach()),
@@ -628,6 +686,20 @@ def _run_over_micrographs(
         index, exc = min(errors, key=lambda item: item[0])
         raise RuntimeError(f"CTF refinement failed on micrograph {index}") from exc
     return results
+
+
+def _initialize_cuda_libraries(device_list: list[torch.device]) -> None:
+    """Initialize lazily loaded CUDA libraries before worker threads start.
+
+    PyTorch loads its CUDA linear-algebra backend on the first ``torch.linalg``
+    call, and that initialization is not thread-safe: two GPU worker threads
+    making their first call at once fail with "lazy wrapper should be called at
+    most once". The magnification-matrix transform (torch-grid-utils) calls
+    ``torch.linalg.inv``, so do one call per device here.
+    """
+    for device in device_list:
+        if device.type == "cuda":
+            torch.linalg.inv(torch.eye(2, device=device))
 
 
 def _collect_local_grads(
@@ -747,6 +819,7 @@ def run_ctf_refinement(
                 log_file,
             )
 
+        _initialize_cuda_libraries(device_list)
         templates = [template.to(device) for device in device_list]
         with torch.no_grad():
             template_dfts = [volume_to_rfft_fourier_slice(t) for t in templates]
@@ -1167,6 +1240,7 @@ def refine_ctf(
     output_directory: str | Path | None = None,
     setup_cache_gpu_gb: float | None = None,
     setup_cache_host_gb: float | None = None,
+    joint_per_micrograph_lbfgs: bool = True,
 ) -> dict[str, Any]:
     """Refine the CTF parameters for the micrographs.
 
@@ -1237,6 +1311,10 @@ def refine_ctf(
     setup_cache_host_gb : float | None
         Pinned host memory (GB) for micrograph inputs that do not fit on the GPU.
         None: 40% of the available host memory. 0: no host cache.
+    joint_per_micrograph_lbfgs : bool
+        With L-BFGS, refine astigmatism, defocus and phase shift of a micrograph
+        with one optimizer (True) or one optimizer per parameter group in turn
+        (False, block-coordinate).
 
     Returns
     -------
@@ -1280,6 +1358,7 @@ def refine_ctf(
         initial_phase_shift_quadratic_k2=initial_phase_shift_quadratic_k2,
         setup_cache_gpu_gb=setup_cache_gpu_gb,
         setup_cache_host_gb=setup_cache_host_gb,
+        joint_per_micrograph_lbfgs=joint_per_micrograph_lbfgs,
     )
     return run_ctf_refinement(
         template=template,
