@@ -45,7 +45,7 @@ class SyntheticProblem:
             "ctf_kwargs": {"phase_shift": 0.0},
             "mag_matrix": torch.eye(2),
         }
-        if kwargs["anistropic_mag"] is not None:
+        if kwargs.get("anistropic_mag") is not None:
             pbk["mag_matrix"] = kwargs["anistropic_mag"]
         return pbk
 
@@ -523,3 +523,105 @@ def test_mag_matrix_is_applied_to_projection_only(monkeypatch, refined):
     )
     assert pbk["ctf_kwargs"]["mag_matrix"] is None
     assert pbk["mag_matrix"] is (refined_matrix if refined else csv_matrix)
+
+
+# ---------------------------------------------------------------------------
+# Input cache
+# ---------------------------------------------------------------------------
+
+
+def test_inputs_built_once_per_micrograph(synthetic, monkeypatch):
+    calls = {"setup": 0}
+    original = synthetic.setup
+
+    def counting_setup(**kwargs: Any) -> dict[str, Any]:
+        calls["setup"] += 1
+        return original(**kwargs)
+
+    monkeypatch.setattr(driver, "setup_particle_backend_for_micrograph", counting_setup)
+    synthetic.target_mag = torch.tensor([[1.01, 0.0], [0.0, 0.99]])
+    flags = {"refine_anisotropic_mag": True, "refine_astigmatism": True}
+
+    cached = run(**flags)
+    assert calls["setup"] == 2  # one build per micrograph for the whole run
+
+    calls["setup"] = 0
+    uncached = run(**flags, setup_cache_gpu_gb=0, setup_cache_host_gb=0)
+    assert calls["setup"] > 10  # rebuilt for every evaluation
+    torch.testing.assert_close(cached["anistropic_mag"], uncached["anistropic_mag"])
+    torch.testing.assert_close(
+        cached["astigmatism_magnitude"], uncached["astigmatism_magnitude"]
+    )
+
+
+def test_input_cache_respects_budget():
+    from picasso.core.core_ctf_refine_cache import MicrographInputCache
+
+    cpu = torch.device("cpu")
+    entry_bytes = 4 * 100
+    cache = MicrographInputCache({cpu: entry_bytes}, host_budget_bytes=0)
+    builds = []
+
+    def build(index: int):
+        def _build() -> dict[str, Any]:
+            builds.append(index)
+            return {"x": torch.full((100,), float(index))}
+
+        return _build
+
+    first = cache.get(0, cpu, build(0))
+    assert cache.get(0, cpu, build(0)) is first  # cached on the device tier
+    cache.get(1, cpu, build(1))
+    cache.get(1, cpu, build(1))  # over budget: rebuilt
+    assert builds == [0, 1, 1]
+    assert "1 micrograph(s) on GPU" in cache.summary()
+    assert "1 rebuilt on every use" in cache.summary()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_input_cache_host_tier():
+    from picasso.core.core_ctf_refine_cache import MicrographInputCache
+
+    gpu = torch.device("cuda:0")
+    cache = MicrographInputCache({gpu: 0}, host_budget_bytes=10**6)
+    builds = []
+
+    def build() -> dict[str, Any]:
+        builds.append(1)
+        return {"x": torch.arange(10.0, device=gpu), "meta": (3, 4)}
+
+    cache.get(0, gpu, build)
+    again = cache.get(0, gpu, build)
+    assert builds == [1]
+    assert again["x"].device == gpu and again["meta"] == (3, 4)
+    torch.testing.assert_close(again["x"].cpu(), torch.arange(10.0))
+    assert "1 in host memory" in cache.summary()
+
+
+@pytest.mark.parametrize("shared_filter", [False, True])
+def test_compacted_inputs_give_same_z_scores(shared_filter):
+    from picasso.core.core_ctf_refine_loss import (
+        compact_backend_kwargs,
+        per_call_kwargs,
+        without_shared_template,
+    )
+
+    kwargs = _synthetic_backend_kwargs(32, 6, torch.device("cpu"))
+    if shared_filter:
+        kwargs["projective_filters"] = (
+            kwargs["projective_filters"][:1].expand(6, -1, -1).clone()
+        )
+    template_dft = kwargs["template_dft"]
+    reference = compute_particle_z_scores(dict(kwargs), batch_size=4)
+
+    cached = compact_backend_kwargs(dict(kwargs), torch.device("cpu"), template_dft)
+    without_shared_template(cached)
+    assert "particle_stack_dft" not in cached
+    static = cached["_picasso_loss_cache"]
+    assert "template_dft" not in static
+    assert static["projective_filters"].shape[0] == (1 if shared_filter else 6)
+    for _ in range(2):  # repeated evaluations reuse the same cached inputs
+        z = compute_particle_z_scores(
+            per_call_kwargs(cached, template_dft), batch_size=4
+        )
+        torch.testing.assert_close(z, reference)

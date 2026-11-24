@@ -77,71 +77,176 @@ def _is_inactive_zernike_dict(zernikes: Any) -> bool:
     return True
 
 
-def _get_static_cache(
+# Raw per-particle tensors of the Leopard-EM backend kwargs that the static
+# inputs replace; dropped by ``compact_backend_kwargs``.
+_RAW_KEYS = (
+    "particle_stack_dft",
+    "template_dft",
+    "projective_filters",
+    "corr_mean",
+    "corr_std",
+    "euler_angles",
+)
+
+
+def prepare_static_inputs(
     particle_backend_kwargs: dict[str, Any],
     device: torch.device,
-) -> dict[str, torch.Tensor]:
-    """Per-micrograph tensors that do not depend on the refined parameters.
+    template_dft: torch.Tensor | None = None,
+) -> dict[str, Any]:
+    """Tensors of one micrograph that do not depend on the refined parameters.
 
-    Stored in ``particle_backend_kwargs`` so repeated loss evaluations on the
-    same micrograph (e.g. inside an L-BFGS closure) reuse them.
+    Built once and stored in ``particle_backend_kwargs`` so repeated loss
+    evaluations on the same micrograph reuse them.
+
+    Parameters
+    ----------
+    particle_backend_kwargs : dict[str, Any]
+        Kwargs from Leopard-EM's ``setup_particle_backend_kwargs``.
+    device : torch.device
+        Device for the returned tensors.
+    template_dft : torch.Tensor | None
+        Shared template RFFT to use instead of the one in the kwargs (avoids a
+        copy per micrograph).
+
+    Returns
+    -------
+    dict[str, Any]
+        Static inputs of ``compute_particle_z_scores``.
     """
-    cache = particle_backend_kwargs.get(_CACHE_KEY)
-    if cache is not None:
-        return cache  # type: ignore[no-any-return]
+    static = particle_backend_kwargs.get(_CACHE_KEY)
+    if static is not None:
+        return static  # type: ignore[no-any-return]
 
+    kwargs = particle_backend_kwargs
     with torch.no_grad():
-        particle_dft = particle_backend_kwargs["particle_stack_dft"].to(device)
-        template_dft = particle_backend_kwargs["template_dft"].to(device)
+        particle_dft = kwargs["particle_stack_dft"].to(device)
+        if template_dft is None:
+            template_dft = kwargs["template_dft"]
+        template_dft = template_dft.to(device)
+        num_particles = particle_dft.shape[0]
         img_h = particle_dft.shape[-2]
         img_w = 2 * (particle_dft.shape[-1] - 1)
         tmpl_h = template_dft.shape[-2]
         tmpl_w = 2 * (template_dft.shape[-1] - 1)
 
-        euler_offsets = particle_backend_kwargs["euler_angle_offsets"].to(device)
+        euler_offsets = kwargs["euler_angle_offsets"].to(device)
         if euler_offsets.shape[0] != 1:
             raise NotImplementedError(
                 "CTF refinement loss supports exactly one Euler angle offset, got "
                 f"{euler_offsets.shape[0]}."
             )
         for name in ("defocus_offsets", "pixel_size_offsets"):
-            if particle_backend_kwargs[name].numel() != 1:
+            if kwargs[name].numel() != 1:
                 raise NotImplementedError(
                     f"CTF refinement loss supports exactly one {name} value, got "
-                    f"{particle_backend_kwargs[name].numel()}."
+                    f"{kwargs[name].numel()}."
                 )
 
         rotation = roma.euler_to_rotmat(
-            EULER_ANGLE_FMT,
-            particle_backend_kwargs["euler_angles"].to(device),
-            degrees=True,
+            EULER_ANGLE_FMT, kwargs["euler_angles"].to(device), degrees=True
         ).to(torch.float32)
         offset_rotation = roma.euler_to_rotmat(
             EULER_ANGLE_FMT, euler_offsets, degrees=True
         ).to(torch.float32)
         rotation = offset_rotation @ rotation  # same composition as Leopard-EM
 
-        dc_mask = torch.ones(
-            tmpl_h, tmpl_w // 2 + 1, device=device, dtype=torch.float32
-        )
+        dc_mask = torch.ones(tmpl_h, tmpl_w // 2 + 1, device=device)
         dc_mask[0, 0] = 0.0
 
-        cache = {
-            "particle_dft": particle_dft,
+        projective_filters = kwargs["projective_filters"].to(device)
+        if projective_filters.shape[0] > 1 and torch.equal(
+            projective_filters, projective_filters[:1].expand_as(projective_filters)
+        ):
+            # With global filtering every particle shares the micrograph's filter.
+            projective_filters = projective_filters[:1].clone()
+
+        static = {
             "template_dft": template_dft,
             "rotation": rotation,
             "dc_mask": dc_mask,
-            "img_shape": torch.tensor([img_h, img_w]),
-            "tmpl_shape": torch.tensor([tmpl_h, tmpl_w]),
+            "projective_filters": projective_filters,
+            "corr_mean": kwargs["corr_mean"].to(device),
+            "corr_std": kwargs["corr_std"].to(device),
+            "defocus_offsets": kwargs["defocus_offsets"].to(device).reshape(1),
+            "pixel_size_offsets": kwargs["pixel_size_offsets"].to(device).reshape(1),
+            "img_shape": (img_h, img_w),
+            "tmpl_shape": (tmpl_h, tmpl_w),
+            "num_particles": num_particles,
         }
         if img_h == tmpl_h and img_w == tmpl_w:
             # Valid cross-correlation is a single pixel (zero shift), which is
             # the real-space dot product of image and projection.
-            cache["particle_real"] = torch.fft.irfftn(
+            static["particle_real"] = torch.fft.irfftn(
                 particle_dft, s=(img_h, img_w), dim=(-2, -1)
             )
-    particle_backend_kwargs[_CACHE_KEY] = cache
-    return cache
+        else:
+            static["particle_dft"] = particle_dft
+    kwargs[_CACHE_KEY] = static
+    return static
+
+
+def compact_backend_kwargs(
+    particle_backend_kwargs: dict[str, Any],
+    device: torch.device,
+    template_dft: torch.Tensor | None = None,
+) -> dict[str, Any]:
+    """Prepare the static inputs and drop the raw tensors they replace.
+
+    The returned kwargs (the same dict, modified in place) hold only what the
+    loss needs, so they are suitable for caching across loss evaluations.
+
+    Parameters
+    ----------
+    particle_backend_kwargs : dict[str, Any]
+        Kwargs from Leopard-EM's ``setup_particle_backend_kwargs``.
+    device : torch.device
+        Device for the static tensors.
+    template_dft : torch.Tensor | None
+        Shared template RFFT (see ``prepare_static_inputs``).
+
+    Returns
+    -------
+    dict[str, Any]
+        The compacted kwargs.
+    """
+    prepare_static_inputs(particle_backend_kwargs, device, template_dft)
+    for key in _RAW_KEYS:
+        particle_backend_kwargs.pop(key, None)
+    return particle_backend_kwargs
+
+
+def without_shared_template(particle_backend_kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Remove the template RFFT from compacted kwargs (in place) before caching.
+
+    The template RFFT is the same for every micrograph on a device, so caches
+    keep one copy per device and re-attach it with ``per_call_kwargs``.
+    """
+    static = particle_backend_kwargs.get(_CACHE_KEY)
+    if static is not None:
+        static.pop("template_dft", None)
+    return particle_backend_kwargs
+
+
+def per_call_kwargs(
+    cached: dict[str, Any],
+    template_dft: torch.Tensor | None = None,
+) -> dict[str, Any]:
+    """Shallow copy of cached kwargs that one loss evaluation may modify.
+
+    Copies the top-level dict, ``ctf_kwargs`` and the static inputs (tensors are
+    shared), and attaches ``template_dft`` to the static inputs if given.
+    """
+    kwargs = dict(cached)
+    if isinstance(cached.get("ctf_kwargs"), dict):
+        kwargs["ctf_kwargs"] = dict(cached["ctf_kwargs"])
+    static = cached.get(_CACHE_KEY)
+    if static is not None:
+        static = dict(static)
+        if template_dft is not None:
+            static["template_dft"] = template_dft
+        kwargs[_CACHE_KEY] = static
+    return kwargs
 
 
 # pylint: disable=too-many-locals
@@ -168,20 +273,23 @@ def compute_particle_z_scores(
         Shape (N,) z-scores.
     """
     kwargs = particle_backend_kwargs
-    device_arg = kwargs.get("device")
-    if isinstance(device_arg, list | tuple) and device_arg:
-        device = torch.device(device_arg[0])
-    elif isinstance(device_arg, torch.device):
-        device = device_arg
+    if _CACHE_KEY in kwargs:
+        device = kwargs[_CACHE_KEY]["rotation"].device
     else:
-        device = kwargs["particle_stack_dft"].device
+        device_arg = kwargs.get("device")
+        if isinstance(device_arg, list | tuple) and device_arg:
+            device = torch.device(device_arg[0])
+        elif isinstance(device_arg, torch.device):
+            device = device_arg
+        else:
+            device = kwargs["particle_stack_dft"].device
 
-    cache = _get_static_cache(kwargs, device)
-    img_h, img_w = (int(v) for v in cache["img_shape"])
-    tmpl_h, tmpl_w = (int(v) for v in cache["tmpl_shape"])
+    cache = prepare_static_inputs(kwargs, device)
+    img_h, img_w = cache["img_shape"]
+    tmpl_h, tmpl_w = cache["tmpl_shape"]
     crop_h = img_h - tmpl_h + 1
     crop_w = img_w - tmpl_w + 1
-    num_particles = cache["particle_dft"].shape[0]
+    num_particles = cache["num_particles"]
 
     defocus_u = torch.as_tensor(kwargs["defocus_u"], device=device).reshape(-1)
     defocus_v = torch.as_tensor(kwargs["defocus_v"], device=device).reshape(-1)
@@ -190,11 +298,12 @@ def compute_particle_z_scores(
     defocus_v = defocus_v.expand(num_particles)
     defocus_angle = defocus_angle.expand(num_particles)
 
-    projective_filters = kwargs["projective_filters"].to(device)
-    corr_mean = kwargs["corr_mean"].to(device)
-    corr_std = kwargs["corr_std"].to(device)
-    defocus_offsets = kwargs["defocus_offsets"].to(device).reshape(1)
-    pixel_size_offsets = kwargs["pixel_size_offsets"].to(device).reshape(1)
+    projective_filters = cache["projective_filters"]
+    shared_filter = projective_filters.shape[0] == 1
+    corr_mean = cache["corr_mean"]
+    corr_std = cache["corr_std"]
+    defocus_offsets = cache["defocus_offsets"]
+    pixel_size_offsets = cache["pixel_size_offsets"]
     mag_matrix = kwargs.get("mag_matrix")
     if mag_matrix is not None:
         mag_matrix = mag_matrix.to(device=device, dtype=torch.float32)
@@ -253,7 +362,10 @@ def compute_particle_z_scores(
         fourier_slice = (
             -torch.fft.ifftshift(fourier_slice, dim=(-2,)) * cache["dc_mask"]
         )
-        spectrum = fourier_slice * (projective_filters[start:stop] * ctf)
+        chunk_filter = (
+            projective_filters if shared_filter else projective_filters[start:stop]
+        )
+        spectrum = fourier_slice * (chunk_filter * ctf)
         spectrum = _make_rfft_hermitian(spectrum, tmpl_w)
 
         projection = torch.fft.irfftn(spectrum, s=(tmpl_h, tmpl_w), dim=(-2, -1))

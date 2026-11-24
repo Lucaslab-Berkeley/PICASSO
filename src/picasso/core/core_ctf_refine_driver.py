@@ -28,9 +28,17 @@ from typing import Any, TypeVar
 
 import torch
 from leopard_em.pydantic_models.config import PreprocessingFilters
+from leopard_em.utils.image_processing import volume_to_rfft_fourier_slice
 
+from picasso.core.core_ctf_refine_cache import MicrographInputCache, resolve_budgets
+from picasso.core.core_ctf_refine_loss import (
+    compact_backend_kwargs,
+    per_call_kwargs,
+    without_shared_template,
+)
 from picasso.core.core_ctf_refine_utils import (
     accumulate_gradients_from_gpu_worker,
+    apply_dataset_params,
     check_convergence,
     clamp_phase_shift_quadratic_after_step,
     compute_micrograph_loss,
@@ -81,6 +89,8 @@ class RefineOptions:
     phase_shift_quadratic_two_axes: bool
     initial_phase_shift_quadratic_g2: float
     initial_phase_shift_quadratic_k2: float
+    setup_cache_gpu_gb: float | None = None
+    setup_cache_host_gb: float | None = None
 
     @property
     def refine_per_micrograph(self) -> bool:
@@ -194,35 +204,42 @@ def _make_optimizer(
     return torch.optim.Adam(param_groups)
 
 
-def _setup_micrograph(
+def _build_micrograph_inputs(
     results_path: str,
     template: torch.Tensor,
+    template_dft: torch.Tensor,
     device: torch.device,
     opts: RefineOptions,
     dataset_params: dict[str, Any],
 ) -> dict[str, Any]:
-    """Leopard-EM particle backend kwargs for one micrograph."""
-    return setup_particle_backend_for_micrograph(
-        results_path=results_path,
-        template=template,
-        template_box_size=opts.template_box_size,
-        device=device,
-        preprocessing_filters=opts.preprocessing_filters,
-        euler_angle_offsets=dataset_params["euler_angle_offsets"],
-        defocus_offsets=dataset_params["defocus_offsets"],
-        pixel_size_offsets=dataset_params["pixel_size_offsets"],
-        apply_global_filtering=opts.apply_global_filtering,
-        anistropic_mag=(
-            dataset_params["anistropic_mag"] if opts.refine_anisotropic_mag else None
-        ),
-        odd_zernikes=dataset_params["odd_zernikes"] if opts.refine_beam_tilt else None,
-    )
+    """Loss inputs of one micrograph that do not depend on refined parameters.
+
+    Runs Leopard-EM's setup (reads the micrograph and correlation maps, filters,
+    extracts particles), then keeps only what the loss needs. The template RFFT is
+    shared per device and left out (re-attached by ``per_call_kwargs``).
+    """
+    with torch.no_grad():
+        pbk = setup_particle_backend_for_micrograph(
+            results_path=results_path,
+            template=template,
+            template_box_size=opts.template_box_size,
+            device=device,
+            preprocessing_filters=opts.preprocessing_filters,
+            euler_angle_offsets=dataset_params["euler_angle_offsets"],
+            defocus_offsets=dataset_params["defocus_offsets"],
+            pixel_size_offsets=dataset_params["pixel_size_offsets"],
+            apply_global_filtering=opts.apply_global_filtering,
+        )
+        if "particle_stack_dft" in pbk:
+            compact_backend_kwargs(pbk, device, template_dft=template_dft)
+            without_shared_template(pbk)
+    return pbk
 
 
 def _micrograph_loop(
     i: int,
     results_path: str,
-    template: torch.Tensor,
+    get_inputs: Callable[[], dict[str, Any]],
     device: torch.device,
     opts: RefineOptions,
     state: MicrographState,
@@ -239,8 +256,9 @@ def _micrograph_loop(
         Micrograph index.
     results_path : str
         Path to the results CSV of this micrograph.
-    template : torch.Tensor
-        Template volume, already on ``device``.
+    get_inputs : Callable[[], dict[str, Any]]
+        Returns this micrograph's loss inputs (a copy this call may modify),
+        e.g. from the input cache.
     device : torch.device
         Device for this micrograph.
     opts : RefineOptions
@@ -262,10 +280,15 @@ def _micrograph_loop(
         Scalar loss (mean of -z over particles) at the returned parameters,
         and the returned per-micrograph state (``loss`` filled in).
     """
-    # Grad stays enabled during setup so the beam-tilt Zernikes it derives from the
-    # (possibly trainable) asinh parameters keep their autograd graph.
+    pbk = get_inputs()
+    # Grad enabled so the beam-tilt Zernikes derived from the (possibly trainable)
+    # asinh parameters keep their autograd graph.
     with torch.enable_grad():
-        pbk = _setup_micrograph(results_path, template, device, opts, dataset_params)
+        apply_dataset_params(
+            pbk,
+            dataset_params["anistropic_mag"] if opts.refine_anisotropic_mag else None,
+            dataset_params["odd_zernikes"] if opts.refine_beam_tilt else None,
+        )
 
     csv_du = torch.as_tensor(pbk["defocus_u"]).float().reshape(-1).to(device)
     csv_dv = torch.as_tensor(pbk["defocus_v"]).float().reshape(-1).to(device)
@@ -654,6 +677,33 @@ def run_ctf_refinement(
             )
 
         templates = [template.to(device) for device in device_list]
+        with torch.no_grad():
+            template_dfts = [volume_to_rfft_fourier_slice(t) for t in templates]
+        device_budgets, host_budget = resolve_budgets(
+            device_list, opts.setup_cache_gpu_gb, opts.setup_cache_host_gb
+        )
+        input_cache = MicrographInputCache(device_budgets, host_budget)
+
+        def inputs_getter(i: int, gpu_id: int) -> Callable[[], dict[str, Any]]:
+            device = device_list[gpu_id]
+
+            def build() -> dict[str, Any]:
+                return _build_micrograph_inputs(
+                    results_path=results_files[i],
+                    template=templates[gpu_id],
+                    template_dft=template_dfts[gpu_id],
+                    device=device,
+                    opts=opts,
+                    dataset_params=local_params[gpu_id],
+                )
+
+            def get_inputs() -> dict[str, Any]:
+                return per_call_kwargs(
+                    input_cache.get(i, device, build), template_dfts[gpu_id]
+                )
+
+            return get_inputs
+
         if num_gpus == 1:
             local_params = [setup_state]
         else:
@@ -681,7 +731,7 @@ def run_ctf_refinement(
                 _, new_state = _micrograph_loop(
                     i=i,
                     results_path=results_files[i],
-                    template=templates[gpu_id],
+                    get_inputs=inputs_getter(i, gpu_id),
                     device=device_list[gpu_id],
                     opts=opts,
                     state=states[i],
@@ -704,7 +754,7 @@ def run_ctf_refinement(
                 loss, _ = _micrograph_loop(
                     i=i,
                     results_path=results_files[i],
-                    template=templates[gpu_id],
+                    get_inputs=inputs_getter(i, gpu_id),
                     device=device_list[gpu_id],
                     opts=opts,
                     state=states[i],
@@ -784,9 +834,10 @@ def run_ctf_refinement(
         )
         initial_avg_loss = sum(s.loss for s in states.values()) / num_micrographs
         _log_message(
-            f"Initial avg loss (before any optimization): {initial_avg_loss:.6f}\n",
+            f"Initial avg loss (before any optimization): {initial_avg_loss:.6f}",
             log_file,
         )
+        _log_message(input_cache.summary() + "\n", log_file)
 
         global_initial_mag = anistropic_mag.detach().clone()
         global_initial_zernikes = {
@@ -896,6 +947,7 @@ def run_ctf_refinement(
                     log_file,
                 )
 
+        _log_message(input_cache.summary(), log_file)
         if opts.refine_anisotropic_mag:
             output_mag_matrix(anistropic_mag)
 
@@ -996,6 +1048,8 @@ def refine_ctf(
     defocus_lr: float = 1.0,
     phase_shift_lr: float = 1.0,
     output_directory: str | Path | None = None,
+    setup_cache_gpu_gb: float | None = None,
+    setup_cache_host_gb: float | None = None,
 ) -> dict[str, Any]:
     """Refine the CTF parameters for the micrographs.
 
@@ -1058,6 +1112,12 @@ def refine_ctf(
         Learning rates for defocus and phase shift.
     output_directory : str | Path | None
         Directory for ``ctf_refinement.log``. No log file if None.
+    setup_cache_gpu_gb : float | None
+        Per-GPU memory (GB) for keeping micrograph inputs between passes. None:
+        40% of each GPU's memory. 0: do not keep inputs on the GPU.
+    setup_cache_host_gb : float | None
+        Pinned host memory (GB) for micrograph inputs that do not fit on the GPU.
+        None: 40% of the available host memory. 0: no host cache.
 
     Returns
     -------
@@ -1099,6 +1159,8 @@ def refine_ctf(
         phase_shift_quadratic_two_axes=phase_shift_quadratic_two_axes,
         initial_phase_shift_quadratic_g2=initial_phase_shift_quadratic_g2,
         initial_phase_shift_quadratic_k2=initial_phase_shift_quadratic_k2,
+        setup_cache_gpu_gb=setup_cache_gpu_gb,
+        setup_cache_host_gb=setup_cache_host_gb,
     )
     return run_ctf_refinement(
         template=template,

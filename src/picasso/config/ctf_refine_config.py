@@ -38,6 +38,11 @@ class CtfRefineConfig(BaseModelPICASSO):
     phase_shift_quadratic_two_axes: bool = False
     phase_shift_quadratic_g2: float = 0.0
     phase_shift_quadratic_k2: float = 0.0
+    # Memory for keeping each micrograph's inputs between passes instead of
+    # re-reading and re-filtering it. None: 40% of each GPU's memory / of the
+    # available host memory. 0 disables that tier.
+    setup_cache_gpu_gb: float | None = None
+    setup_cache_host_gb: float | None = None
 
     @model_validator(mode="after")  # type: ignore
     def validate_optimizer(self) -> Self:

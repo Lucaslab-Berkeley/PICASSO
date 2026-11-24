@@ -202,6 +202,34 @@ def quad_params_to_dict(
     }
 
 
+def apply_dataset_params(
+    particle_backend_kwargs: dict[str, Any],
+    anistropic_mag: torch.Tensor | None,
+    odd_zernikes: dict[str, torch.Tensor] | None,
+) -> None:
+    """Put the dataset-level parameters into particle backend kwargs (in place).
+
+    Parameters
+    ----------
+    particle_backend_kwargs : dict[str, Any]
+        Particle backend kwargs.
+    anistropic_mag : torch.Tensor | None
+        Magnification matrix for the projections; None keeps the current one.
+    odd_zernikes : dict[str, torch.Tensor] | None
+        Beam tilt in asinh space ("asinh_Z31c", "asinh_Z31s"); None keeps the
+        Zernikes from the results CSV.
+    """
+    if anistropic_mag is not None:
+        particle_backend_kwargs["mag_matrix"] = anistropic_mag
+    if odd_zernikes is not None:
+        # Convert from asinh space; the scale matches setup_refinement_parameters.
+        zernike_scale = 1e6
+        particle_backend_kwargs["ctf_kwargs"]["odd_zernikes"] = {
+            "Z31c": zernike_scale * torch.sinh(odd_zernikes["asinh_Z31c"]),
+            "Z31s": zernike_scale * torch.sinh(odd_zernikes["asinh_Z31s"]),
+        }
+
+
 def setup_particle_backend_for_micrograph(
     results_path: str,
     template: torch.Tensor,
@@ -278,16 +306,7 @@ def setup_particle_backend_for_micrograph(
     # it twice. Leopard-EM puts the results-CSV matrix on both; drop it from the
     # CTF here. The projection keeps the CSV matrix unless a refined one is given.
     particle_backend_kwargs["ctf_kwargs"]["mag_matrix"] = None
-    if anistropic_mag is not None:
-        particle_backend_kwargs["mag_matrix"] = anistropic_mag
-    if odd_zernikes is not None:
-        # Convert from asinh space to actual values using sinh()
-        # Scale factor matches the one used in setup_refinement_parameters
-        zernike_scale = 1e6
-        particle_backend_kwargs["ctf_kwargs"]["odd_zernikes"] = {
-            "Z31c": zernike_scale * torch.sinh(odd_zernikes["asinh_Z31c"]),
-            "Z31s": zernike_scale * torch.sinh(odd_zernikes["asinh_Z31s"]),
-        }
+    apply_dataset_params(particle_backend_kwargs, anistropic_mag, odd_zernikes)
 
     return cast("dict[str, Any]", particle_backend_kwargs)
 

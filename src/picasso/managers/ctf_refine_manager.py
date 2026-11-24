@@ -128,6 +128,8 @@ class CTFRefineManager(BaseModelPICASSO):
             "initial_phase_shift_quadratic_k2": (
                 self.ctf_refine_config.phase_shift_quadratic_k2
             ),
+            "setup_cache_gpu_gb": self.ctf_refine_config.setup_cache_gpu_gb,
+            "setup_cache_host_gb": self.ctf_refine_config.setup_cache_host_gb,
         }
 
         return backend_kwargs
