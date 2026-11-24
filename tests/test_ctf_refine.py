@@ -408,6 +408,10 @@ def test_make_rfft_hermitian_is_real_part_of_inverse():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Leopard-EM needs CUDA")
+# Leopard-EM's torch.compile'd projection normalization warns during tracing on
+# recent PyTorch (.grad of a non-leaf tensor); with warnings as errors, dynamo
+# turns that into a failure. The warning is in the reference implementation.
+@pytest.mark.filterwarnings("ignore::UserWarning")
 def test_loss_matches_leopard_em():
     from leopard_em.backend.core_differentiable_refine import (
         core_differentiable_refine,
