@@ -238,7 +238,8 @@ def setup_particle_backend_for_micrograph(
     apply_global_filtering : bool
         Whether to apply global filtering.
     anistropic_mag : torch.Tensor | None, optional
-        Anisotropic magnification matrix. If provided, used as mag_matrix.
+        Anisotropic magnification matrix applied to the projections. If None, the
+        matrix from the results CSV (if any) is used. Never applied to the CTF.
     odd_zernikes : dict[str, torch.Tensor] | None, optional
         Odd Zernike coefficients. If provided, added to CTF kwargs.
 
@@ -270,12 +271,15 @@ def setup_particle_backend_for_micrograph(
         device_list=[device],
     )
 
-    # Change params for optimizable parameters. The magnification matrix distorts
-    # the recorded image, so it applies to both the projection (Fourier slice) and
-    # the CTF, as Leopard-EM does for the matrix read from the results CSV.
+    # The magnification matrix distorts the projection (Fourier slice) only. The
+    # CTF parameters come from CTF estimation on the recorded micrograph, whose CTF
+    # rings already carry the magnification distortion (absorbed into the fitted
+    # defocus/astigmatism), so stretching the CTF by the matrix as well would count
+    # it twice. Leopard-EM puts the results-CSV matrix on both; drop it from the
+    # CTF here. The projection keeps the CSV matrix unless a refined one is given.
+    particle_backend_kwargs["ctf_kwargs"]["mag_matrix"] = None
     if anistropic_mag is not None:
         particle_backend_kwargs["mag_matrix"] = anistropic_mag
-        particle_backend_kwargs["ctf_kwargs"]["mag_matrix"] = anistropic_mag
     if odd_zernikes is not None:
         # Convert from asinh space to actual values using sinh()
         # Scale factor matches the one used in setup_refinement_parameters

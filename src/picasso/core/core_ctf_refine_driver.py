@@ -127,11 +127,7 @@ def _raise_if_nonfinite(
     if loss_ok and not bad:
         return
     problem = "loss" if not loss_ok else f"gradient of parameter(s) {bad}"
-    raise FloatingPointError(
-        f"Non-finite {problem} in {context}. If the anisotropic magnification is "
-        "refined, check that torch-grid-utils includes the fix for the atan2 "
-        "gradient at the origin (NaN on older PyTorch releases)."
-    )
+    raise FloatingPointError(f"Non-finite {problem} in {context}.")
 
 
 def _log_message(message: str, log_file: Any = None) -> None:

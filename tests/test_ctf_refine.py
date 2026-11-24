@@ -481,3 +481,45 @@ def test_non_finite_loss_stops_refinement(synthetic, monkeypatch):
     monkeypatch.setattr(driver, "compute_micrograph_loss", nan_loss)
     with pytest.raises(FloatingPointError, match="Non-finite loss in micrograph 1"):
         run(refine_astigmatism=True)
+
+
+# ---------------------------------------------------------------------------
+# Magnification matrix goes to the projection only
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("refined", [True, False])
+def test_mag_matrix_is_applied_to_projection_only(monkeypatch, refined):
+    """The CTF is never stretched: CTF parameters come from the recorded image."""
+    import picasso.core.core_ctf_refine_utils as utils
+
+    csv_matrix = torch.tensor([[1.01, 0.0], [0.0, 0.99]])
+
+    class FakeParticleStack:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        def get_euler_angles(self, prefer_refined_angles: bool) -> torch.Tensor:
+            return torch.zeros(3, 3)
+
+    def fake_setup(**kwargs: Any) -> dict[str, Any]:
+        # Leopard-EM puts the results-CSV matrix on both projection and CTF.
+        return {"mag_matrix": csv_matrix, "ctf_kwargs": {"mag_matrix": csv_matrix}}
+
+    monkeypatch.setattr(utils, "ParticleStack", FakeParticleStack)
+    monkeypatch.setattr(utils, "setup_particle_backend_kwargs", fake_setup)
+    refined_matrix = torch.tensor([[0.998, 0.001], [0.001, 0.997]])
+    pbk = utils.setup_particle_backend_for_micrograph(
+        results_path="unused.csv",
+        template=torch.zeros(4, 4, 4),
+        template_box_size=(4, 4),
+        device=torch.device("cpu"),
+        preprocessing_filters=None,
+        euler_angle_offsets=torch.zeros(1, 3),
+        defocus_offsets=torch.zeros(1),
+        pixel_size_offsets=torch.zeros(1),
+        apply_global_filtering=True,
+        anistropic_mag=refined_matrix if refined else None,
+    )
+    assert pbk["ctf_kwargs"]["mag_matrix"] is None
+    assert pbk["mag_matrix"] is (refined_matrix if refined else csv_matrix)
